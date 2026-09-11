@@ -1,0 +1,26 @@
+[build]
+target = "riscv32imc-esp-espidf"
+
+[target.'cfg(target_os = "espidf")']
+linker = "ldproxy"
+#runner = "espflash flash --monitor"
+runner = "espflash flash --baud=1843200 --monitor"
+rustflags = [ "--cfg",  "espidf_time64"]
+
+[unstable]
+build-std = ["std", "panic_abort"]
+
+[env]
+MCU = "esp32c3"
+ESP_IDF_VERSION = "v5.5.3"
+ESP_IDF_TOOLS_INSTALL_DIR = "workspace"
+
+NODEM_ARCH = "ESP32-C3"
+
+# CONFIG_PARTITION_TABLE_CUSTOM_FILENAME (sdkconfig.defaults) is resolved relative
+# to the generated ESP-IDF cmake project dir, not the crate root - so copy
+# partitions.csv there via esp-idf-sys's glob-copy mechanism.
+ESP_IDF_GLOB_PARTITIONS_BASE = { value = "", relative = true }
+ESP_IDF_GLOB_PARTITIONS_CSV = "partitions.csv"
+
+CARGO_WORKSPACE_DIR = { value = "", relative = true }

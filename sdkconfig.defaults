@@ -1,0 +1,89 @@
+# Rust often needs a bit of an extra main task stack size compared to C (the default is 3K)
+# You might have to increase this further if you allocate large stack variables in the main task
+#
+# Bumped from 8192 after a "Stack protection fault" (fault site was deep in
+# an unrelated WiFi SSID/password conversion, which is normal for a stack
+# overflow - it trips wherever the stack pointer happens to cross the guard
+# region, not necessarily where the pressure built up) that followed
+# `irgb::FRAME_LEN` growing to a few KB for `#irgb`'s configurable bit
+# timing/resolution. `irgb_task`'s own `Framebuffer::render` no longer
+# returns that buffer by value (see its doc comment), which should have been
+# the dominant contributor, but this adds headroom on top of that fix rather
+# than relying on it alone - all of `main`'s async tasks share this one
+# stack, so it's worth keeping generous as more of them grow their own
+# stack-resident state.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+
+# Increase a bit these stack sizes as they are also a bit too small by default
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
+CONFIG_FREERTOS_IDLE_TASK_STACKSIZE=4096
+
+# You might have to increase this further if you spawn your own Rust threads
+# that allocate large stack variables; or better yet - use
+# `std::thread::Builder::new().stack_size(XXX)` for spawning
+CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=4096
+
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# partitions.csv needs 3.1MB (nvs + phy_init + 2M factory app + 1M nodem_int),
+# which doesn't fit the default 2MB flash size assumption - bump to 4MB.
+# Adjust if your board's actual flash chip is smaller/larger than 4MB.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# --- Firmware size optimizations ---
+# Standard ESP-IDF "reduce binary size" advice, trimmed to what's actually
+# safe for what this firmware does (Wi-Fi STA/WPA2-Personal, TLS client only,
+# no Bluetooth). CONFIG_COMPILER_OPTIMIZATION_SIZE is already the default.
+
+# Not used anywhere in this project - keep it fully out of the build.
+CONFIG_BT_ENABLED=n
+
+# `connect_wifi`/`do_connect_wifi` in main.rs only ever connect as a
+# WPA2-Personal station - never SoftAP, WPA3, or WPA2-Enterprise/802.1X.
+CONFIG_ESP_WIFI_SOFTAP_SUPPORT=n
+CONFIG_ESP_WIFI_ENABLE_WPA3_SAE=n
+CONFIG_ESP_WIFI_ENABLE_WPA3_OWE_STA=n
+CONFIG_ESP_WIFI_ENTERPRISE_SUPPORT=n
+
+# The device only ever acts as a TLS *client* (the websocket and the HTTP
+# registration request), never a server, and only ever validates against our
+# own `certs/rootCA.pem` (`X509::pem_until_nul(ROOT_CA_CERT)` in main.rs) -
+# never the ~200-cert bundle `crt_bundle_attach` would pull in, which nothing
+# in this codebase references.
+CONFIG_MBEDTLS_TLS_CLIENT_ONLY=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=n
+
+# newlib's compact printf/scanf family (smaller flash footprint than full
+# newlib, but can't print 64-bit integers or positional format arguments,
+# and silently mishandles `%f`/`%lld`). Our own logging goes through Rust's
+# `core::fmt`, not newlib, so this only affects ESP-IDF's internal C-side
+# logging.
+#
+# Set to `n` (costs a few KB of flash) after a "Stack protection fault"
+# inside _svfprintf_r/_vsnprintf_r during the WPA2 4-way handshake looked
+# like nano's parser desyncing on a format string it couldn't handle -
+# though the real cause turned out to be `CARGO_WORKSPACE_DIR` (see
+# .cargo/config.toml) resolving one directory too deep, which silently
+# dropped this whole file from every build, nano-format included (the
+# crashing builds never actually had nano format on to begin with). Worth
+# trying `y` again now that this file is actually reaching the build.
+CONFIG_LIBC_NEWLIB_NANO_FORMAT=n
+
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# `LOG_DEFAULT_LEVEL` above only sets the runtime filter - `LOG_MAXIMUM_LEVEL`
+# is the compile-time ceiling, and defaults higher (pulling in Debug/Verbose
+# log strings and call sites from every ESP-IDF C component, wifi/lwip/mbedtls
+# included, that never actually print at runtime). Pin it to match.
+CONFIG_LOG_MAXIMUM_LEVEL_INFO=y
+
+# Trims assert() failure strings (file/line/expression text) from ESP-IDF's C
+# components down to nothing printed - the assert still aborts, just silently.
+CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_SILENT=y
+
+# Trades a few KB of esp_err_to_name()'s lookup table for less descriptive
+# `{:?}`-formatted errors - e.g. "UNKNOWN ERROR" instead of
+# "ESP_ERR_WIFI_TIMEOUT" - in every `log::error!("...: {e:?}")` call across
+# main.rs (wifi_task, websocket_task, register_device, ...).
+CONFIG_ESP_ERR_TO_NAME_LOOKUP=n
