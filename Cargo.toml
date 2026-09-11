@@ -1,0 +1,45 @@
+[package]
+name = "nodem-esp32"
+version = "0.1.0"
+authors = ["saschaklick <sascha.klick@toasternet.eu>"]
+edition = "2021"
+resolver = "2"
+rust-version = "1.82"
+
+[[bin]]
+name = "nodem-esp32"
+harness = false
+
+[features]
+cloud = []
+
+[profile.release]
+strip = true
+opt-level = "s"
+lto = true
+codegen-units = 1
+
+[profile.dev]
+debug = true
+opt-level = "z"
+[patch.crates-io]
+esp-idf-sys = { git = "https://github.com/esp-rs/esp-idf-sys.git" }
+esp-idf-hal = { git = "https://github.com/esp-rs/esp-idf-hal.git" }
+esp-idf-svc = { git = "https://github.com/esp-rs/esp-idf-svc.git" }
+
+[dependencies]
+log = { version = "0.4", features = ["release_max_level_off"] }
+anyhow = "1"
+embedded-svc = "0.29"
+esp-idf-svc = { version = "0.52.1", features = ["critical-section", "embassy-time-driver", "embassy-sync"] }
+embassy-time = { version = "0.5", features = ["generic-queue-8"] }
+edge-executor = "0.5"
+ssd1306 = { version = "0.10", default-features = false }
+nodem-rs = { git = "https://github.com/saschaklick/nodem-rs", features = ["std", "base", "alloc"] }
+virtmach = { git = "https://github.com/saschaklick/virtmach-rs", features = ["i16", "random"] }
+
+[build-dependencies]
+embuild = "0.33"
+
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "espressif/esp_websocket_client", version = "1.1.0" }
