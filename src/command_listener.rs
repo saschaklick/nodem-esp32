@@ -355,7 +355,7 @@ impl IControl for CommandListener {
 
 
 impl IControlLoader for CommandListener {
-    fn process_loader_start(&mut self, _len: usize) -> usize {
+    fn process_loader_start(&mut self, len: usize) -> usize {
         log::info!("process_loader_start");
         self.pkg_buf_len = 0;
         self.pkg_written = 0;
@@ -375,17 +375,25 @@ impl IControlLoader for CommandListener {
         let size = partition.size();
         self.pkg_partition = Some(partition);
 
-        // Flash can only clear bits, never set them, so the whole region has
-        // to be erased up front before `process_loader_data` can write into
-        // it - a per-chunk erase would repeatedly re-erase (and thus wipe)
-        // earlier chunks that share the same erase block as a later one.
-        if let Err(e) = self.pkg_partition.as_mut().unwrap().erase(0, size) {
+        let erase_size = self.pkg_partition.as_ref().unwrap().erase_size();
+        let erase_len = (len + erase_size - 1) / erase_size * erase_size;
+
+        // Flash can only clear bits, never set them, so the region the
+        // package will occupy has to be erased up front, rounded up to whole
+        // flash sectors (`erase_size`) - a per-chunk erase would repeatedly
+        // re-erase (and thus wipe) earlier chunks that share the same erase
+        // block as a later one.
+        if let Err(e) = self.pkg_partition.as_mut().unwrap().erase(0, erase_len) {
             log::error!("'{PKG_PARTITION_LABEL}' partition erase failed: {e:?}");
             self.pkg_partition = None;
             return 0;
         }
 
-        size
+        if size >= len {
+            size
+        }else {
+            0
+        }
     }
 
     fn process_loader_data(&mut self, buf: &[u8], pos: usize) {
@@ -394,13 +402,14 @@ impl IControlLoader for CommandListener {
             self.pkg_buf_len += 1;
 
             if self.pkg_buf_len == PKG_CHUNK_LEN {
+                self.pkg_buf_len = 0;
+
                 let Some(partition) = self.pkg_partition.as_mut() else { return; };
                 let offset = pos + i + 1 - PKG_CHUNK_LEN;
                 if let Err(e) = partition.write(offset, &self.pkg_buf) {
                     log::error!("'{PKG_PARTITION_LABEL}' partition write at {offset} failed: {e:?}");
                 }
                 self.pkg_written = offset + PKG_CHUNK_LEN;
-                self.pkg_buf_len = 0;
             }
         }
     }
