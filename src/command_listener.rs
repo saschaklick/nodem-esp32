@@ -1,7 +1,7 @@
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs};
 use esp_idf_svc::partition::{EspMemMapType, EspPartition};
 
-use nodem_rs::{ control::{ Control, IControl, IControlLoader }, media::Media };
+use nodem_rs::{ control::{ Control, IControl, IControlLoader, LoaderRet }, media::Media };
 
 use crate::global::{CloudConnectionStatus, CloudStatus, RegistrationStatus, WifiConnectionStatus, WifiStatus};
 use crate::iled::{self, IledConfig};
@@ -414,14 +414,14 @@ impl IControlLoader for CommandListener {
         }
     }
 
-    fn process_loader_end(&mut self) -> u8 {
+    fn process_loader_end(&mut self) -> LoaderRet {
         log::info!("process_loader_end");
-        let Some(partition) = self.pkg_partition.as_mut() else { return 1; };
+        let Some(partition) = self.pkg_partition.as_mut() else { return LoaderRet::NotEnoughSpace; };
 
         if self.pkg_buf_len > 0 {
             if let Err(e) = partition.write(self.pkg_written, &self.pkg_buf[..self.pkg_buf_len]) {
                 log::error!("'{PKG_PARTITION_LABEL}' partition write at {} failed: {e:?}", self.pkg_written);
-                return 1;
+                return LoaderRet::NotEnoughSpace;
             }
             self.pkg_written += self.pkg_buf_len;
             self.pkg_buf_len = 0;
@@ -431,7 +431,7 @@ impl IControlLoader for CommandListener {
             Ok(mapped) => mapped,
             Err(e) => {
                 log::error!("'{PKG_PARTITION_LABEL}' partition mmap failed: {e:?}");
-                return 1;
+                return LoaderRet::NotEnoughSpace;
             }
         };
         let ptr = mapped.start() as *const u8;
@@ -443,6 +443,6 @@ impl IControlLoader for CommandListener {
         core::mem::forget(mapped);
 
         self.pkg_reload = Some((ptr, len));
-        0
+        LoaderRet::Ok
     }
 }
