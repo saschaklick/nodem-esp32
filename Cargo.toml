@@ -5,6 +5,9 @@ authors = ["saschaklick <sascha.klick@toasternet.eu>"]
 edition = "2021"
 resolver = "2"
 rust-version = "1.82"
+repository = "https://github.com/saschaklick/nodem-esp32"
+description = "ESP32 implementation for nodem-rs with cloud connectivity"
+license = "MIT"
 
 [[bin]]
 name = "nodem-esp32"
