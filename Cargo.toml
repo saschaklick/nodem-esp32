@@ -25,6 +25,8 @@ codegen-units = 1
 [profile.dev]
 debug = true
 opt-level = "z"
+lto = true
+
 [patch.crates-io]
 esp-idf-sys = { git = "https://github.com/esp-rs/esp-idf-sys.git" }
 esp-idf-hal = { git = "https://github.com/esp-rs/esp-idf-hal.git" }
