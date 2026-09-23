@@ -23,12 +23,21 @@ CONFIG_FREERTOS_IDLE_TASK_STACKSIZE=4096
 # `std::thread::Builder::new().stack_size(XXX)` for spawning
 CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=4096
 
+# Which table is used depends on the build profile - `CONFIG_PARTITION_TABLE_CUSTOM_FILENAME`
+# is set per profile in sdkconfig.defaults.release / sdkconfig.defaults.debug.
 CONFIG_PARTITION_TABLE_CUSTOM=y
-CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
-# partitions.csv needs 3.1MB (nvs + phy_init + 2M factory app + 1M nodem_int),
-# which doesn't fit the default 2MB flash size assumption - bump to 4MB.
-# Adjust if your board's actual flash chip is smaller/larger than 4MB.
+# An OTA-updated image boots as "pending verify" and is rolled back to the
+# previous slot on the next reset unless `heartbeat_task` marks it valid
+# (60s after boot). Lives in the bootloader, so it only takes effect with the
+# bootloader built from this config - scripts/flash.sh flashes that one
+# rather than espflash's bundled default.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# Both partitions.release.csv and partitions.debug.csv lay out the full 4MB
+# (the pkg partition takes whatever is left at the end), which doesn't fit
+# the default 2MB flash size assumption. Adjust both tables along with this
+# if your board's actual flash chip is smaller/larger than 4MB.
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 
 # --- Firmware size optimizations ---

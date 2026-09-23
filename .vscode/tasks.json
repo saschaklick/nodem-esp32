@@ -38,20 +38,8 @@
 		},
 		{
 			"type": "shell",
-			"command": "espflash",
-			"args": [
-				"save-image",
-				"--chip", "esp32c3",
-  				"--flash-size", "4mb",
-  				"--merge",
-  				"--bootloader", "target/riscv32imc-esp-espidf/release/build/bootloader.bin",
-  				"--partition-table", "partitions.csv",
-  				"target/riscv32imc-esp-espidf/release/nodem-esp32",
-  				"nodem_ESP32-C3.bin"
-			],
-			"problemMatcher": [
-				"$rustc"
-			],
+			"command": "scripts/sign.sh",
+			"problemMatcher": [],
 			"group": "build",
 			"dependsOn": [
 				"rust: cargo build --release"

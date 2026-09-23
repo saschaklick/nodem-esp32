@@ -3,8 +3,9 @@ target = "riscv32imc-esp-espidf"
 
 [target.'cfg(target_os = "espidf")']
 linker = "ldproxy"
-#runner = "espflash flash --monitor"
-runner = "espflash flash --baud=1843200 --monitor"
+# Wrapper around `espflash flash --baud=1843200` that picks the
+# partition table matching the build profile - see the script.
+runner = "scripts/flash.sh"
 rustflags = [ "--cfg",  "espidf_time64"]
 
 [unstable]
@@ -17,10 +18,10 @@ ESP_IDF_TOOLS_INSTALL_DIR = "workspace"
 
 NODEM_ARCH = "ESP32-C3"
 
-# CONFIG_PARTITION_TABLE_CUSTOM_FILENAME (sdkconfig.defaults) is resolved relative
-# to the generated ESP-IDF cmake project dir, not the crate root - so copy
-# partitions.csv there via esp-idf-sys's glob-copy mechanism.
+# CONFIG_PARTITION_TABLE_CUSTOM_FILENAME (sdkconfig.defaults.<profile>) is resolved
+# relative to the generated ESP-IDF cmake project dir, not the crate root - so copy
+# both partitions.<profile>.csv there via esp-idf-sys's glob-copy mechanism.
 ESP_IDF_GLOB_PARTITIONS_BASE = { value = "", relative = true }
-ESP_IDF_GLOB_PARTITIONS_CSV = "partitions.csv"
+ESP_IDF_GLOB_PARTITIONS_CSV = "partitions.*.csv"
 
 CARGO_WORKSPACE_DIR = { value = "", relative = true }

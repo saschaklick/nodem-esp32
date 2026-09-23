@@ -1,4 +1,5 @@
-partition_table = "partitions.csv"
+# No `partition_table` here: it differs per build profile, so
+# scripts/flash.sh passes the right one via `--partition-table`.
 
 [connection]
 

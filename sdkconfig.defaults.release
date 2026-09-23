@@ -1,0 +1,20 @@
+# Layered on top of sdkconfig.defaults for `cargo build --release` (esp-idf-sys
+# picks up `sdkconfig.defaults.<profile>` on its own) - see the file for the layout.
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.release.csv"
+
+# OTA updates have to be signed (RSA-3072, the Secure Boot V2 scheme - the
+# only one the ESP32-C3 supports) with the same key as the running firmware:
+# `esp_ota_end` checks a new image's signature against the public key in the
+# *running* app's signature block. No eFuses involved - this is software-only
+# verification ("signed apps without hardware secure boot"), so USB flashing
+# stays unrestricted. Consequence: the running release firmware must itself
+# be signed, or it aborts at startup (ESP-IDF refuses to run with no way to
+# verify any update) - which is why scripts/flash.sh flashes release builds
+# only via scripts/sign.sh.
+CONFIG_SECURE_SIGNED_APPS_NO_SECURE_BOOT=y
+CONFIG_SECURE_SIGNED_APPS_RSA_SCHEME=y
+CONFIG_SECURE_SIGNED_ON_UPDATE_NO_SECURE_BOOT=y
+# esp-idf-sys only builds ESP-IDF's libraries - the app image comes from
+# cargo/espflash, so ESP-IDF's own build-time signing step never runs.
+# scripts/sign.sh signs instead.
+CONFIG_SECURE_BOOT_BUILD_SIGNED_BINARIES=n

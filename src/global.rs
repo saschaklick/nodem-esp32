@@ -1,5 +1,6 @@
 use std::net::Ipv4Addr;
 
+use esp_idf_svc::ws::client::EspWebSocketClient;
 use nodem_rs::runtime::DOM;
 
 use crate::iled::IledConfig;
@@ -137,12 +138,93 @@ impl std::fmt::Display for CloudStatus {
     }
 }
 
+/// The running firmware itself - filled in by `heartbeat_task` at startup
+/// (`ota_slot`/`rollback_pending`) and again once it ends the rollback phase,
+/// read by `nodem_task` for the status popup.
+#[derive(Clone)]
+pub struct SysStatus {
+    pub version: &'static str,
+    // 0/1 for `ota_0`/`ota_1`, `None` until known (or if the running
+    // partition isn't an OTA slot at all).
+    pub ota_slot: Option<u8>,
+    // The running image is still unverified - the bootloader will roll back
+    // to the previous slot on the next reset unless it gets marked valid.
+    pub rollback_pending: bool,
+}
+
+impl SysStatus {
+    pub fn new() -> Self {
+        Self {
+            version: env!("CARGO_PKG_VERSION"),
+            ota_slot: None,
+            rollback_pending: false,
+        }
+    }
+}
+
+impl std::fmt::Display for SysStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Sys: {} (", self.version)?;
+        match self.ota_slot {
+            Some(slot) => write!(f, "{slot}")?,
+            None => write!(f, "?")?,
+        }
+        if self.rollback_pending {
+            write!(f, "r")?;
+        }
+        write!(f, ")")
+    }
+}
+
+/// Where `oled_task` currently is with the SSD1306 - `Failed` after the
+/// initial `init()` failed is permanent (`oled_task` gives up and returns),
+/// whereas after a failed reinitialization the next flush simply tries again.
+#[derive(Clone)]
+pub enum OledConnectionStatus {
+    Initializing,
+    Connected,
+    Failed(String),
+}
+
+/// Everything `oled_task` knows about the display - updated by `oled_task`,
+/// read by `heartbeat_task` for logging. `errors` counts every failed flush
+/// attempt (each one of up to `MAX_ATTEMPTS` per frame), `reinits` every time
+/// the display had to be reinitialized after all of a frame's attempts failed.
+#[derive(Clone)]
+pub struct OledStatus {
+    pub status: OledConnectionStatus,
+    pub errors: u32,
+    pub reinits: u32,
+}
+
+impl OledStatus {
+    pub fn new() -> Self {
+        Self {
+            status: OledConnectionStatus::Initializing,
+            errors: 0,
+            reinits: 0,
+        }
+    }
+}
+
+impl std::fmt::Display for OledStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.status {
+            OledConnectionStatus::Initializing => write!(f, "OLED: initializing..."),
+            OledConnectionStatus::Connected => write!(f, "OLED: connected"),
+            OledConnectionStatus::Failed(e) => write!(f, "OLED: failed ({e})"),
+        }
+    }
+}
+
 /// Shared, cross-task state. The executor is single-threaded and cooperative,
 /// so `Rc<RefCell<_>>` (no atomics/locking needed) is enough - only one task
 /// ever runs at a time.
 pub struct Global {
+    pub sys_status: SysStatus,
     pub wifi_status: WifiStatus,
     pub cloud_status: CloudStatus,
+    pub oled_status: OledStatus,
     // Boxed so the heap allocation's address - which `runtime`'s `Surface` holds
     // a raw pointer into (see `nodem_rs::Surface::framebuffer`) - stays fixed
     // even as `Global` itself gets moved around (e.g. into the `Rc<RefCell<_>>`
@@ -156,7 +238,10 @@ pub struct Global {
     // `DISPLAY_BUFFER_CONSUMERS`'s doc comment for why this isn't one shared
     // flag.
     pub display_buffer_dirty: [bool; DISPLAY_BUFFER_CONSUMERS],
-    pub runtime: DOM,
+    // `'static`: `runtime.status_message` borrows a string that `Global`
+    // can't own alongside it - `nodem_task` leaks each new status text and
+    // frees the previous one itself, see `set_status_message` there.
+    pub runtime: DOM<'static>,
     // Incoming-command staging buffer for `uart_task`: bytes read off the UART
     // accumulate here until `runtime.process_command` has consumed a full
     // command; `command_buf_pos` is how much of it is currently filled.
@@ -172,13 +257,15 @@ pub struct Global {
     // back to `IledConfig::default()` the way every individually-blank
     // field does - see `command_listener`'s "#iled" handling.
     pub iled_config: Option<IledConfig>,
-    // Set (mirrored from `CommandListener::take_pkg_reload`) by `uart_task`/
-    // `websocket_task` right after a "#pkg" upload finishes flashing, same
-    // pattern as `iled_config`/`cloud_status.device_name` above. Taken by
-    // `nodem_task`, which actually owns the `Surface`/`Media` a pkg needs to
-    // be loaded into - the pointer/length of the upload's memory-mapped flash
-    // region, valid forever (see `CommandListener::process_loader_end`).
-    pub pkg_reload: Option<(*const u8, usize)>,
+    // Set (mirrored from `CommandListener::take_pkg_updated`) by `uart_task`/
+    // `websocket_task` right after a "pkg" upload has been written to the
+    // "pkg" partition, same pattern as `iled_config` above. Taken by
+    // `nodem_task`, which owns the `Surface`/`Media` the pkg is loaded into.
+    pub pkg_reload: bool,
+    // The cloud websocket while `websocket_task` has one - kept here, not in
+    // that task, so `websocket::close_websocket` can close it cleanly from
+    // wherever Wi-Fi is about to go down.
+    pub ws_client: Option<EspWebSocketClient<'static>>,
 }
 
 impl Global {
@@ -191,8 +278,10 @@ impl Global {
         );
 
         Self {
+            sys_status: SysStatus::new(),
             wifi_status: WifiStatus::new(),
             cloud_status: CloudStatus::new(),
+            oled_status: OledStatus::new(),
             display_buffer,
             display_buffer_dirty: [false; DISPLAY_BUFFER_CONSUMERS],
             runtime,
@@ -201,7 +290,8 @@ impl Global {
             wifi_reconnect: false,
             reregister: false,
             iled_config: Some(IledConfig::default()),
-            pkg_reload: None,
+            pkg_reload: false,
+            ws_client: None,
         }
     }
 }

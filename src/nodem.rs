@@ -2,63 +2,60 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use embassy_time::{Duration, Instant, Timer};
-use esp_idf_svc::partition::{EspMemMapType, EspPartition};
+use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs};
+use esp_idf_svc::sys::{self, esp_partition_mmap_handle_t};
+
+use nodem_rs::media::Ret;
 use nodem_rs::runtime::Runtime;
 
-use crate::command_listener::PKG_PARTITION_LABEL;
+use crate::command_listener::{CommandListener, PKG_PARTITION_LABEL};
 use crate::global::{CloudConnectionStatus, Global, WifiConnectionStatus, DISPLAY_BUFFER_CONSUMERS};
 
 /// How long Wi-Fi and cloud both need to have been continuously connected
 /// before the status overlay stops being drawn.
 const HIDE_REPORT_AFTER: Duration = Duration::from_secs(5);
 
-/// Advances the `nodem_rs` DOM runtime and re-renders the Wi-Fi status overlay
-/// into `Global::display_buffer`, 60 times a second. Only touches the in-memory
-/// framebuffer (marking it dirty for every `Global::display_buffer_dirty`
+// pub(crate): written by `CommandListener` on every "page=<value>" line,
+// removed by "#factory".
+pub(crate) const NVS_NAMESPACE: &str = "nodem";
+pub(crate) const NVS_KEY_LAST_PAGE: &str = "last_page";
+
+/// Advances the `nodem_rs` DOM runtime, 60 times a second, keeping its
+/// `status_message` popup set to the current Wi-Fi/cloud status - the runtime
+/// itself renders it into `Global::display_buffer` as part of `run()`. Only
+/// touches the in-memory framebuffer (marking it dirty for every `Global::display_buffer_dirty`
 /// consumer - `oled_task` and `iled_task` - at once) - never talks to a
 /// display itself.
 ///
 /// The overlay is suppressed once Wi-Fi and cloud have both been connected for
 /// `HIDE_REPORT_AFTER` straight - `connected_since` tracks the start of the
 /// current unbroken "both connected" streak (reset to `None` the moment either
-/// drops), so a hidden report reappears immediately on any disconnect. Safe to
-/// just skip the draw calls below rather than explicitly clearing the overlay
-/// area first: `g.runtime.run()` clears the whole surface every frame (outside
-/// the intro/loader-busy states) before anything here draws to it.
-pub async fn nodem_task(global: Rc<RefCell<Global>>) {
+/// drops), so a hidden report reappears immediately on any disconnect. It also
+/// stays up for as long as `Global::sys_status.rollback_pending` - i.e. until
+/// `heartbeat_task` has marked a freshly OTA-updated firmware valid.
+///
+/// Before the first frame, the pkg in the "pkg" partition (if any - written
+/// by a "pkg" upload) is loaded, and the page last shown (`NVS_KEY_LAST_PAGE`, see `CommandListener`'s
+/// "page=" handling) restored by running "page=<last_page>" through
+/// `process_command`, just as if it had been received over UART/websocket.
+/// Every later "pkg" upload is loaded as soon as it's written
+/// (`Global::pkg_reload`), without a restart - the page isn't restored then.
+pub async fn nodem_task(global: Rc<RefCell<Global>>, nvs: EspDefaultNvsPartition) {
     let mut connected_since: Option<Instant> = None;
+    let mut pkg_mapping: Option<*const u8> = None;
 
-    // One-time check at startup: if a "pkg" partition already exists (i.e.
-    // it was flashed by a previous "#pkg" upload), wire `pkg_reload` up to it
-    // so the loop below loads it on its very first iteration, the same way
-    // it would after a fresh upload - see `CommandListener::process_loader_end`.
     {
         let mut g = global.borrow_mut();
-        match unsafe { EspPartition::new(PKG_PARTITION_LABEL) } {
-            Ok(Some(mut partition)) => {
-                // Layout: b"PKG0" magic, then a native-endian u32 giving the
-                // pkg's total length (magic included) - see `Media::load_pkg`,
-                // which CRCs every byte up to that length.
-                let mut header = [0u8; 8];
-                match partition.read(0, &mut header) {
-                    Ok(()) if &header[0..4] == b"PKG0" => {
-                        let len = u32::from_ne_bytes(header[4..8].try_into().unwrap()) as usize;
-                        match unsafe { partition.mmap(0, len, EspMemMapType::Data) } {
-                            Ok(mapped) => {
-                                // Leaked deliberately - see `process_loader_end`'s
-                                // matching comment.
-                                g.pkg_reload = Some((mapped.start() as *const u8, len));
-                                core::mem::forget(mapped);
-                            }
-                            Err(e) => log::error!("'{PKG_PARTITION_LABEL}' partition mmap failed: {e:?}"),
-                        }
-                    }
-                    Ok(()) => log::info!("'{PKG_PARTITION_LABEL}' partition has no pkg, skipping reload"),
-                    Err(e) => log::error!("'{PKG_PARTITION_LABEL}' partition read failed: {e:?}"),
-                }
-            }
-            Ok(None) => {}
-            Err(e) => log::error!("'{PKG_PARTITION_LABEL}' partition lookup failed: {e:?}"),
+        let loaded = load_pkg_partition(&mut g, &mut pkg_mapping);
+
+        let mut buf = [0u8; 8];
+        let last_page = EspNvs::new(nvs.clone(), NVS_NAMESPACE, false).ok().and_then(|nvs| nvs.get_str(NVS_KEY_LAST_PAGE, &mut buf).ok().flatten().map(str::to_string));
+        if let Some(page) = last_page.filter(|_| loaded) {
+            let mut listener = CommandListener::new(nvs.clone());
+            let mut response = String::new();
+            let command = format!("page={page}\n");
+            let _ = g.runtime.process_command(command.as_bytes(), &mut response, &mut listener);
+            log::info!("restored {}: {}", command.trim(), response.trim());
         }
     }
 
@@ -66,12 +63,9 @@ pub async fn nodem_task(global: Rc<RefCell<Global>>) {
         {
             let mut g = global.borrow_mut();
 
-            if let Some((ptr, len)) = g.pkg_reload.take() {
-                let ret = g.runtime.surface.media.load_pkg(ptr, len, 2) as u8;
-                log::info!("pkg reload: {ret}");
+            if core::mem::take(&mut g.pkg_reload) {
+                load_pkg_partition(&mut g, &mut pkg_mapping);
             }
-
-            g.runtime.run();
 
             let both_connected = matches!(g.wifi_status.status, WifiConnectionStatus::Connected)
                 && matches!(g.cloud_status.connection, CloudConnectionStatus::Connected);
@@ -82,20 +76,94 @@ pub async fn nodem_task(global: Rc<RefCell<Global>>) {
                 (false, _) => None,
             };
 
-            let show_report = connected_since.map_or(true, |since| since.elapsed() < HIDE_REPORT_AFTER);
+            let show_report = g.sys_status.rollback_pending
+                || connected_since.map_or(true, |since| since.elapsed() < HIDE_REPORT_AFTER);
 
-            if show_report {
-                let font = 0;
-                let messages = format!("{}{{br}}{}", g.wifi_status, g.cloud_status);
-                let size = g.runtime.surface.get_text_size(nodem_rs::media::Identifier::Index(font), messages.as_str());
-                g.runtime.surface.draw_rect(nodem_rs::Area { point: nodem_rs::Point { x: 0, y: 0 }, size: nodem_rs::Size { width: size.width + 6, height: size.height + 6 } }, 1);
-                g.runtime.surface.fill_rect(nodem_rs::Area { point: nodem_rs::Point { x: 1, y: 1 }, size: nodem_rs::Size { width: size.width + 4, height: size.height + 4 } }, 0);
-                g.runtime.surface.draw_text(nodem_rs::media::Identifier::Index(font), messages.as_str(), nodem_rs::Point { x: 3, y: 3 });
-            }
+            let message = show_report.then(|| format!("{}{{br}}{}{{br}}{}", g.sys_status, g.wifi_status, g.cloud_status));
+            set_status_message(&mut g.runtime, message);
+
+            g.runtime.run();
 
             g.display_buffer_dirty = [true; DISPLAY_BUFFER_CONSUMERS];
         }
 
         Timer::after_millis(1000 / 60).await;
     }
+}
+
+/// Points `runtime.status_message` at `message`, but only swaps in a new
+/// string when the text actually changed - the status only changes on
+/// Wi-Fi/cloud events, not every frame. `DOM::status_message` borrows a
+/// `&'static str`, so each new message is leaked into one and the previous
+/// one freed here once `runtime` no longer points at it.
+fn set_status_message(runtime: &mut nodem_rs::runtime::DOM<'static>, message: Option<String>) {
+    if runtime.status_message == message.as_deref() {
+        return;
+    }
+
+    let old = core::mem::replace(&mut runtime.status_message, message.map(|m| &*Box::leak(m.into_boxed_str())));
+
+    if let Some(old) = old {
+        // SAFETY: every `status_message` is set only here, from a
+        // `Box::leak`ed `Box<str>`, and `runtime` - its sole holder - has just
+        // been pointed elsewhere, so nothing else still references it.
+        drop(unsafe { Box::from_raw(old as *const str as *mut str) });
+    }
+}
+
+/// Loads the pkg stored in the "pkg" partition, if there is one, into the
+/// live `Media` (as source 2). Layout: b"PKG0" magic, then a native-endian u32
+/// giving the pkg's total length (magic included) - see `Media::load_pkg`,
+/// which CRCs every byte up to that length.
+///
+/// The loaded `Media` points straight into flash, so the partition is
+/// memory-mapped once - the whole of it, on first use - and then stays mapped
+/// for the rest of the process's life (`mapping`), with every later load
+/// reusing it: a pkg upload writes the same flash region again, and ESP-IDF
+/// keeps the mapped view in sync with such writes. Not a fresh mapping per
+/// load, releasing the previous one: ESP-IDF hands out the *existing* mapping
+/// for a region that's already mapped (without a handle of its own), so
+/// releasing the "old" one unmapped the new pkg too - an MMU fault on the
+/// next access.
+fn load_pkg_partition(g: &mut Global, mapping: &mut Option<*const u8>) -> bool {
+    let Ok(label) = std::ffi::CString::new(PKG_PARTITION_LABEL) else { return false; };
+    let partition = unsafe {
+        sys::esp_partition_find_first(sys::esp_partition_type_t_ESP_PARTITION_TYPE_DATA, sys::esp_partition_subtype_t_ESP_PARTITION_SUBTYPE_ANY, label.as_ptr())
+    };
+    let Some(partition_size) = (unsafe { partition.as_ref() }).map(|p| p.size as usize) else { return false; };
+
+    let mut header = [0u8; 8];
+    if let Err(e) = sys::esp!(unsafe { sys::esp_partition_read(partition, 0, header.as_mut_ptr() as *mut _, header.len()) }) {
+        log::error!("'{PKG_PARTITION_LABEL}' partition read failed: {e:?}");
+        return false;
+    }
+    if &header[0..4] != b"PKG0" {
+        log::info!("'{PKG_PARTITION_LABEL}' partition has no pkg, skipping load");
+        return false;
+    }
+    let len = u32::from_ne_bytes(header[4..8].try_into().unwrap()) as usize;
+    if len > partition_size {
+        log::error!("'{PKG_PARTITION_LABEL}': pkg header claims {len} bytes, partition only {partition_size}");
+        return false;
+    }
+
+    let ptr = match *mapping {
+        Some(ptr) => ptr,
+        None => {
+            let mut ptr: *const core::ffi::c_void = core::ptr::null();
+            // Never unmapped - see above.
+            let mut handle: esp_partition_mmap_handle_t = 0;
+            if let Err(e) = sys::esp!(unsafe { sys::esp_partition_mmap(partition, 0, partition_size, sys::esp_partition_mmap_memory_t_ESP_PARTITION_MMAP_DATA, &mut ptr, &mut handle) }) {
+                log::error!("'{PKG_PARTITION_LABEL}' partition mmap failed: {e:?}");
+                return false;
+            }
+            *mapping = Some(ptr as *const u8);
+            ptr as *const u8
+        }
+    };
+
+    let ret = g.runtime.surface.media.load_pkg(ptr, len, 2);
+    let loaded = matches!(ret, Ret::Ok);
+    log::info!("pkg load: {}", ret as u8);
+    loaded
 }

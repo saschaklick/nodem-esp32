@@ -1,0 +1,12 @@
+# Dev: OTA isn't expected to work here - `ota_1` is only the smallest app
+# partition possible (0x10000, app partitions are 64KB-aligned) so the table
+# has the same shape as release, and `ota_0` gets that slot's space instead,
+# for the much larger unoptimized debug image. `pkg` sits at the same offset
+# and size as in partitions.release.csv.
+# Name,   Type, SubType, Offset,   Size,     Flags
+nvs,      data, nvs,     0x9000,   0x4000,
+otadata,  data, ota,     0xd000,   0x2000,
+phy_init, data, phy,     0xf000,   0x1000,
+ota_0,    app,  ota_0,   0x10000,  0x2b0000,
+ota_1,    app,  ota_1,   0x2c0000, 0x10000,
+pkg,      data, spiffs,  0x2d0000, 0x130000,

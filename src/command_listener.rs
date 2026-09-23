@@ -1,15 +1,17 @@
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs};
-use esp_idf_svc::partition::{EspMemMapType, EspPartition};
+use esp_idf_svc::partition::EspPartition;
+use esp_idf_svc::sys::{self, esp, esp_ota_handle_t, esp_partition_t};
 
-use nodem_rs::{ control::{ Control, IControl, IControlLoader, LoaderRet }, media::Media };
+use nodem_rs::{ control::{ Control, ControlMode, IControl, IControlLoader, LoaderRet }, media::Media };
 
 use crate::global::{CloudConnectionStatus, CloudStatus, RegistrationStatus, WifiConnectionStatus, WifiStatus};
 use crate::iled::{self, IledConfig};
+use crate::nodem;
 use crate::websocket;
 use crate::wifi;
 
 pub(crate) const PKG_PARTITION_LABEL: &str = "pkg";
-const PKG_CHUNK_LEN: usize = 512;
+const LOADER_CHUNK_LEN: usize = 512;
 
 #[repr(u8)]
 #[derive(PartialEq)]
@@ -54,23 +56,31 @@ pub(crate) struct CommandListener {
     // "#stat" command below has something to report.
     wifi_status: WifiStatus,
     cloud_status: CloudStatus,
-    // Backing store for "#pkg" uploads (see `IControlLoader` below).
+    // Backing store for "pkg" uploads (see `pkg_start` below).
     pkg_partition: Option<EspPartition>,
-    pkg_buf: [u8; PKG_CHUNK_LEN],
-    pkg_buf_len: usize,
-    // Absolute offset in the "pkg" partition of the next byte to be written -
-    // `process_loader_end` needs this to flush a final, sub-`PKG_CHUNK_LEN`
-    // chunk, since (unlike `process_loader_data`) it isn't given a position.
+    // Absolute offset in the "pkg" partition of the next byte to be written.
     pkg_written: usize,
-    // Set by `process_loader_end` once the upload has been flashed and
-    // memory-mapped - the pointer/length of that mapping, for a caller to
-    // mirror into `Global::pkg_reload` (same reason/pattern as
-    // `wifi_reconnect`/`reregister` above) so `nodem_task` can actually call
-    // `Media::load_pkg` on the *live* `Surface::media` next time it runs,
-    // rather than on a `Media` here that nothing ever renders from. The
-    // mapping itself is never unmapped (see `process_loader_end`) - it has to
-    // stay valid for as long as whatever `Media` loads it is in use.
-    pkg_reload: Option<(*const u8, usize)>,
+    // Set by `pkg_end` once a pkg upload has been fully written, for callers
+    // to mirror into `Global::pkg_reload` (same reason/pattern as
+    // `wifi_reconnect`/`reregister` above) - `nodem_task`, which owns the
+    // live `Surface::media`, then loads it from the partition.
+    pkg_updated: bool,
+    // An "ota" upload in progress: the `esp_ota_begin` handle and the
+    // inactive OTA slot it writes into. Uses the raw `esp_ota_*` API rather
+    // than `esp_idf_svc::ota::EspOta`, which only allows a single instance at
+    // a time - `heartbeat_task` holds that one - and whose `EspOtaUpdate`
+    // borrows it, which a struct field here can't do.
+    ota: Option<(esp_ota_handle_t, *const esp_partition_t)>,
+    // Shared by both upload kinds (see `IControlLoader` below): which one is
+    // in progress (`None` if its start was refused), the staging buffer the
+    // loader's one-byte-at-a-time data is collected in before each
+    // `pkg_write`/`ota_write`, and whether any of those writes has failed -
+    // the rest of the upload is still consumed (the loader can't be stopped
+    // midway), but `pkg_end`/`ota_end` then fail rather than activating it.
+    loader_mode: Option<ControlMode>,
+    loader_buf: [u8; LOADER_CHUNK_LEN],
+    loader_buf_len: usize,
+    loader_failed: bool,
 }
 
 impl CommandListener {
@@ -85,10 +95,13 @@ impl CommandListener {
             wifi_status: WifiStatus::new(),
             cloud_status: CloudStatus::new(),
             pkg_partition: None,
-            pkg_buf: [0u8; PKG_CHUNK_LEN],
-            pkg_buf_len: 0,
             pkg_written: 0,
-            pkg_reload: None,
+            pkg_updated: false,
+            ota: None,
+            loader_mode: None,
+            loader_buf: [0u8; LOADER_CHUNK_LEN],
+            loader_buf_len: 0,
+            loader_failed: false,
         }
     }
 
@@ -112,8 +125,8 @@ impl CommandListener {
         core::mem::take(&mut self.iled_config)
     }
 
-    pub(crate) fn take_pkg_reload(&mut self) -> Option<(*const u8, usize)> {
-        core::mem::take(&mut self.pkg_reload)
+    pub(crate) fn take_pkg_updated(&mut self) -> bool {
+        core::mem::take(&mut self.pkg_updated)
     }
 
     pub(crate) fn update_status(&mut self, wifi_status: &WifiStatus, cloud_status: &CloudStatus) {
@@ -186,6 +199,7 @@ impl IControl for CommandListener {
                     self.remove(websocket::NVS_NAMESPACE, websocket::NVS_KEY_DEVICE_ID);
                     self.remove(websocket::NVS_NAMESPACE, websocket::NVS_KEY_DEVICE_SECRET);
                     self.remove(websocket::NVS_NAMESPACE, websocket::NVS_KEY_CLOUD_HOST);
+                    self.remove(nodem::NVS_NAMESPACE, nodem::NVS_KEY_LAST_PAGE);
                     self.wifi_reconnect = true;
                     self.reregister = true;
                 }
@@ -290,6 +304,7 @@ impl IControl for CommandListener {
                     let _ = self.write_masked(res, websocket::NVS_NAMESPACE, websocket::NVS_KEY_REGISTRATION_CODE);
                     let _ = self.write_plain(res, websocket::NVS_NAMESPACE, websocket::NVS_KEY_CLOUD_HOST);
                     let _ = self.write_plain(res, iled::NVS_NAMESPACE, iled::NVS_KEY_CONFIG);
+                    let _ = self.write_plain(res, nodem::NVS_NAMESPACE, nodem::NVS_KEY_LAST_PAGE);
                 }
                 // Two CSV lines, one per status struct - the last field of
                 // each ("failed"'s error message) is left unescaped and thus
@@ -346,6 +361,22 @@ impl IControl for CommandListener {
             }
             Control::send_result(prefix, ret as u8, res)
         }else{
+            // "page=<value>" is remembered as `nodem::NVS_KEY_LAST_PAGE` (so
+            // `nodem_task` can replay it at boot), but otherwise left alone:
+            // returning `false` hands the same line on to the next listener -
+            // the DOM's own `control::dom` listener - which actually switches
+            // the page and sends the result. Only written when the value
+            // changed, since the boot replay itself comes through here too
+            // and page switches may be frequent - no need to wear the flash.
+            // Values the DOM would reject (anything but a `u8`) aren't stored.
+            if let Some(("page", value)) = line.split_once('=').map(|(k, v)| (k.trim(), v.trim())).filter(|(_, v)| v.parse::<u8>().is_ok()) {
+                let mut buf = [0u8; 8];
+                let stored = EspNvs::new(self.nvs.clone(), nodem::NVS_NAMESPACE, false).ok().and_then(|nvs| nvs.get_str(nodem::NVS_KEY_LAST_PAGE, &mut buf).ok().flatten().map(str::to_string));
+                if stored.as_deref() != Some(value) {
+                    let mut ret = Ret::Ok;
+                    self.store(nodem::NVS_NAMESPACE, nodem::NVS_KEY_LAST_PAGE, value, 1, 3, &mut ret);
+                }
+            }
             (false, Ok(()))
         }
     }
@@ -354,14 +385,85 @@ impl IControl for CommandListener {
 }
 
 
+/// Both "pkg" and "ota" uploads go through here: `process_loader_start`
+/// picks the mode, then the data is staged in `loader_buf` and handed on in
+/// `LOADER_CHUNK_LEN` pieces to that mode's `*_write`, and
+/// `process_loader_end` flushes the remainder and finishes via its `*_end`.
+/// A new pkg is loaded live (see `pkg_updated`); a new firmware takes a
+/// restart (see `ota_end`).
 impl IControlLoader for CommandListener {
-    fn process_loader_start(&mut self, len: usize) -> usize {
+    fn process_loader_start(&mut self, mode: ControlMode, len: usize) -> usize {
         log::info!("process_loader_start");
-        self.pkg_buf_len = 0;
+
+        // A previous "ota" upload that never reached `process_loader_end`
+        // (e.g. the connection dropped midway) - release its handle first.
+        if let Some((handle, _)) = self.ota.take() {
+            unsafe { sys::esp_ota_abort(handle) };
+        }
+
+        self.loader_buf_len = 0;
+        self.loader_failed = false;
+
+        let size = match mode {
+            ControlMode::PKGMode => self.pkg_start(len),
+            ControlMode::OTAMode => self.ota_start(len),
+            _ => 0,
+        };
+        self.loader_mode = (size > 0).then_some(mode);
+        size
+    }
+
+    fn process_loader_data(&mut self, buf: &[u8], _pos: usize) {
+        for &byte in buf {
+            self.loader_buf[self.loader_buf_len] = byte;
+            self.loader_buf_len += 1;
+            if self.loader_buf_len == LOADER_CHUNK_LEN {
+                self.loader_flush();
+            }
+        }
+    }
+
+    fn process_loader_end(&mut self) -> LoaderRet {
+        log::info!("process_loader_end");
+        self.loader_flush();
+
+        match self.loader_mode.take() {
+            Some(ControlMode::PKGMode) => self.pkg_end(),
+            Some(ControlMode::OTAMode) => self.ota_end(),
+            _ => LoaderRet::NotEnoughSpace,
+        }
+    }
+}
+
+impl CommandListener {
+    /// Hands whatever is staged in `loader_buf` on to the current mode's
+    /// `*_write` - skipped once a write has failed, since the upload is
+    /// already lost at that point.
+    fn loader_flush(&mut self) {
+        let len = core::mem::take(&mut self.loader_buf_len);
+        if len == 0 || self.loader_failed {
+            return;
+        }
+
+        let ok = match self.loader_mode {
+            Some(ControlMode::PKGMode) => self.pkg_write(len),
+            Some(ControlMode::OTAMode) => self.ota_write(len),
+            _ => true,
+        };
+        if !ok {
+            self.loader_failed = true;
+        }
+    }
+}
+
+/// "pkg" uploads, into the "pkg" partition - loaded from there by
+/// `nodem_task` right away (via `pkg_updated`), and again on every boot.
+impl CommandListener {
+    fn pkg_start(&mut self, len: usize) -> usize {
         self.pkg_written = 0;
         self.pkg_partition = None;
 
-        let partition = match unsafe { EspPartition::new(PKG_PARTITION_LABEL) } {
+        let mut partition = match unsafe { EspPartition::new(PKG_PARTITION_LABEL) } {
             Ok(Some(partition)) => partition,
             Ok(None) => {
                 log::error!("'{PKG_PARTITION_LABEL}' partition not found");
@@ -373,9 +475,12 @@ impl IControlLoader for CommandListener {
             }
         };
         let size = partition.size();
-        self.pkg_partition = Some(partition);
+        if len > size {
+            log::error!("'{PKG_PARTITION_LABEL}': pkg is {len} bytes, partition only {size}");
+            return 0;
+        }
 
-        let erase_size = self.pkg_partition.as_ref().unwrap().erase_size();
+        let erase_size = partition.erase_size();
         let erase_len = (len + erase_size - 1) / erase_size * erase_size;
 
         // Flash can only clear bits, never set them, so the region the
@@ -383,66 +488,99 @@ impl IControlLoader for CommandListener {
         // flash sectors (`erase_size`) - a per-chunk erase would repeatedly
         // re-erase (and thus wipe) earlier chunks that share the same erase
         // block as a later one.
-        if let Err(e) = self.pkg_partition.as_mut().unwrap().erase(0, erase_len) {
+        if let Err(e) = partition.erase(0, erase_len) {
             log::error!("'{PKG_PARTITION_LABEL}' partition erase failed: {e:?}");
-            self.pkg_partition = None;
             return 0;
         }
 
-        if size >= len {
-            size
-        }else {
-            0
-        }
+        self.pkg_partition = Some(partition);
+        size
     }
 
-    fn process_loader_data(&mut self, buf: &[u8], pos: usize) {
-        for (i, &byte) in buf.iter().enumerate() {            
-            self.pkg_buf[self.pkg_buf_len] = byte;
-            self.pkg_buf_len += 1;
-
-            if self.pkg_buf_len == PKG_CHUNK_LEN {
-                self.pkg_buf_len = 0;
-
-                let Some(partition) = self.pkg_partition.as_mut() else { return; };
-                let offset = pos + i + 1 - PKG_CHUNK_LEN;
-                if let Err(e) = partition.write(offset, &self.pkg_buf) {
-                    log::error!("'{PKG_PARTITION_LABEL}' partition write at {offset} failed: {e:?}");
-                }
-                self.pkg_written = offset + PKG_CHUNK_LEN;
-            }
+    fn pkg_write(&mut self, len: usize) -> bool {
+        let Some(partition) = self.pkg_partition.as_mut() else { return false; };
+        if let Err(e) = partition.write(self.pkg_written, &self.loader_buf[..len]) {
+            log::error!("'{PKG_PARTITION_LABEL}' partition write at {} failed: {e:?}", self.pkg_written);
+            return false;
         }
+        self.pkg_written += len;
+        true
     }
 
-    fn process_loader_end(&mut self) -> LoaderRet {
-        log::info!("process_loader_end");
-        let Some(partition) = self.pkg_partition.as_mut() else { return LoaderRet::NotEnoughSpace; };
-
-        if self.pkg_buf_len > 0 {
-            if let Err(e) = partition.write(self.pkg_written, &self.pkg_buf[..self.pkg_buf_len]) {
-                log::error!("'{PKG_PARTITION_LABEL}' partition write at {} failed: {e:?}", self.pkg_written);
-                return LoaderRet::NotEnoughSpace;
-            }
-            self.pkg_written += self.pkg_buf_len;
-            self.pkg_buf_len = 0;
+    fn pkg_end(&mut self) -> LoaderRet {
+        if self.pkg_partition.take().is_none() || self.loader_failed {
+            return LoaderRet::NotEnoughSpace;
         }
+        self.pkg_updated = true;
+        LoaderRet::Ok
+    }
+}
 
-        let mapped = match unsafe { partition.mmap(0, self.pkg_written, EspMemMapType::Data) } {
-            Ok(mapped) => mapped,
-            Err(e) => {
-                log::error!("'{PKG_PARTITION_LABEL}' partition mmap failed: {e:?}");
-                return LoaderRet::NotEnoughSpace;
-            }
+/// "ota" uploads. The image goes into whichever OTA slot isn't running
+/// (`esp_ota_get_next_update_partition`) and only replaces the running
+/// firmware once `esp_ota_end` has verified it - image checksum/hash, and in
+/// release builds its signature against the key that signed the running app
+/// (`CONFIG_SECURE_SIGNED_ON_UPDATE_NO_SECURE_BOOT`, see
+/// sdkconfig.defaults.release). Only then is it made the boot slot and a
+/// restart requested (`restart`, acted on by callers once the result has
+/// been sent). It boots in the rollback phase - see `heartbeat_task`.
+impl CommandListener {
+    fn ota_start(&mut self, len: usize) -> usize {
+        let partition = unsafe { sys::esp_ota_get_next_update_partition(core::ptr::null()) };
+        let Some(size) = (unsafe { partition.as_ref() }).map(|p| p.size as usize) else {
+            log::error!("OTA: no update partition");
+            return 0;
         };
-        let ptr = mapped.start() as *const u8;
-        let len = self.pkg_written;
-        // Leaked deliberately: whichever `Media` eventually loads this (see
-        // `pkg_reload`'s doc comment) will point straight into this mapping,
-        // so it must never be unmapped (which is what
-        // `EspMemMappedPartition::drop` would otherwise do).
-        core::mem::forget(mapped);
+        if len > size {
+            log::error!("OTA: image is {len} bytes, update partition only {size}");
+            return 0;
+        }
 
-        self.pkg_reload = Some((ptr, len));
+        // `OTA_WITH_SEQUENTIAL_WRITES`: erase sector by sector as data comes
+        // in, rather than the whole image's worth up front.
+        let mut handle: esp_ota_handle_t = 0;
+        // Also refused (`ESP_ERR_OTA_ROLLBACK_INVALID_STATE`) while the
+        // running firmware is itself still in its rollback phase.
+        if let Err(e) = esp!(unsafe { sys::esp_ota_begin(partition, sys::OTA_WITH_SEQUENTIAL_WRITES as usize, &mut handle) }) {
+            log::error!("OTA: begin failed: {e:?}");
+            return 0;
+        }
+
+        self.ota = Some((handle, partition));
+        size
+    }
+
+    fn ota_write(&mut self, len: usize) -> bool {
+        let Some((handle, _)) = self.ota else { return false; };
+        if let Err(e) = esp!(unsafe { sys::esp_ota_write(handle, self.loader_buf.as_ptr() as *const _, len) }) {
+            log::error!("OTA: write failed: {e:?}");
+            return false;
+        }
+        true
+    }
+
+    fn ota_end(&mut self) -> LoaderRet {
+        let Some((handle, partition)) = self.ota.take() else { return LoaderRet::Aborted; };
+
+        if self.loader_failed {
+            unsafe { sys::esp_ota_abort(handle) };
+            return LoaderRet::Aborted;
+        }
+
+        // Validates the whole image (and, in release builds, its signature) -
+        // frees `handle` either way.
+        if let Err(e) = esp!(unsafe { sys::esp_ota_end(handle) }) {
+            log::error!("OTA: image verification failed: {e:?}");
+            return LoaderRet::Aborted;
+        }
+
+        if let Err(e) = esp!(unsafe { sys::esp_ota_set_boot_partition(partition) }) {
+            log::error!("OTA: setting boot partition failed: {e:?}");
+            return LoaderRet::Aborted;
+        }
+
+        log::info!("OTA: update verified, restarting into it");
+        self.restart = true;
         LoaderRet::Ok
     }
 }

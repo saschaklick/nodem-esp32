@@ -1,6 +1,5 @@
 use std::cell::RefCell;
 use std::rc::Rc;
-use esp_idf_svc::hal::reset::restart;
 use esp_idf_svc::hal::uart::{AsyncUartDriver, UartDriver};
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use embassy_time::Timer;
@@ -91,8 +90,8 @@ pub async fn uart_task(
                 if let Some(iled_config) = interrupt.take_iled_config() {
                     g.iled_config = iled_config;
                 }
-                if let Some(pkg_reload) = interrupt.take_pkg_reload() {
-                    g.pkg_reload = Some(pkg_reload);
+                if interrupt.take_pkg_updated() {
+                    g.pkg_reload = true;
                 }
 
                 match ret.1 {
@@ -112,7 +111,8 @@ pub async fn uart_task(
                 // out over the wire - `restart()` never returns.
                 if interrupt.take_restart() {
                     log::info!("Reset requested, restarting...");
-                    restart();
+                    drop(guard);
+                    crate::websocket::restart(&global);
                 }
             }else{
                 log::error!("UART read error");

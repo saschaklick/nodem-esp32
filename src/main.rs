@@ -25,20 +25,22 @@ use global::Global;
 
 fn main() -> anyhow::Result<()> {
     esp_idf_svc::sys::link_patches();
-    esp_idf_svc::log::EspLogger::initialize_default();
+    let logger = esp_idf_svc::log::init_from_esp_idf();
+    #[cfg(not(debug_assertions))]
+    if option_env!("LOG_LEVEL").is_none() {
+        log::set_max_level(log::LevelFilter::Off);
+    }
+    apply_log_levels(logger.filter());
 
-    // A release build never logs over UART at all, from boot - not just
-    // once a real client starts talking the "#..." protocol over it, the
-    // way a debug build does (see `uart::uart_task`'s doc comment for that
+    // A release build doesn't log (the Rust side - ESP-IDF's own C
+    // components keep their `info` default) unless `LOG_LEVEL` says so - not
+    // just once a real client starts talking the "#..." protocol over UART,
+    // the way a debug build does (see `uart::uart_task`'s doc comment for that
     // dynamic, first-byte-triggered switch, which still applies here too but
-    // starts from an already-silent baseline). This isn't done here at
-    // runtime - `Cargo.toml`'s `log` dependency has
-    // `features = ["release_max_level_off"]`, which compiles every `log::`
-    // macro call above that level out of the binary entirely whenever
-    // `debug_assertions` is disabled, rather than just filtering them at
-    // runtime: smaller/faster release binary, and no risk of a call site
-    // that captures something expensive still paying for it just to have
-    // the result thrown away.
+    // starts from an already-silent baseline). A runtime filter rather than
+    // compiling logging out (`log`'s `release_max_level_off` feature, as
+    // before), so `LOG_LEVEL=info cargo run --release` works too - at the
+    // cost of the log strings staying in the binary.
 
     let peripherals = Peripherals::take()?;
     let sys_loop = EspSystemEventLoop::take()?;
@@ -80,7 +82,7 @@ fn main() -> anyhow::Result<()> {
 
     executor.spawn(heartbeat::heartbeat_task(global.clone())).detach();
     executor.spawn(iled::iled_task(global.clone(), nvs.clone())).detach();
-    executor.spawn(nodem::nodem_task(global.clone())).detach();
+    executor.spawn(nodem::nodem_task(global.clone(), nvs.clone())).detach();
     executor.spawn(oled::oled_task(i2c, global.clone())).detach();
     executor.spawn(uart::uart_task(uart, global.clone(), nvs.clone())).detach();
     executor.spawn(websocket::websocket_task(global.clone(), nvs.clone())).detach();
@@ -89,4 +91,39 @@ fn main() -> anyhow::Result<()> {
     block_on(executor.run(core::future::pending::<()>()));
 
     Ok(())
+}
+
+/// Log levels from `LOG_LEVEL`, read at *build* time - the device can't be
+/// handed anything at runtime, so e.g. `LOG_LEVEL=debug cargo run`. Cargo
+/// rebuilds on its own whenever the variable changes (`option_env!` is
+/// tracked). Same shape as `RUST_LOG`: a comma-separated list of either a
+/// bare level (`off`/`error`/`warn`/`info`/`debug`/`trace`), applied to
+/// everything - ESP-IDF's own C components (wifi, lwip, ...) included - or
+/// `<target>=<level>` for a single Rust module path or ESP-IDF tag, e.g.
+/// `LOG_LEVEL=warn,nodem_esp32=debug`. Unset keeps ESP-IDF's default (`info`,
+/// see sdkconfig.defaults).
+///
+/// Levels above `info` need `CONFIG_LOG_MAXIMUM_LEVEL` raised, which only
+/// dev builds do (sdkconfig.defaults.debug) - release builds go up to `info`.
+/// Unset, release builds keep the Rust side silent (see `main`).
+fn apply_log_levels(filter: &esp_idf_svc::log::EspIdfLogFilter) {
+    let Some(spec) = option_env!("LOG_LEVEL") else { return; };
+
+    let mut max = log::max_level();
+    for entry in spec.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        let (target, level) = entry.split_once('=').map_or(("*", entry), |(t, l)| (t.trim(), l.trim()));
+        let Ok(level) = level.parse::<log::LevelFilter>() else {
+            log::warn!("LOG_LEVEL: invalid level in '{entry}'");
+            continue;
+        };
+        if target == "*" {
+            max = level;
+        } else {
+            max = max.max(level);
+        }
+        if let Err(e) = filter.set_target_level(target, level) {
+            log::warn!("LOG_LEVEL: setting '{entry}' failed: {e:?}");
+        }
+    }
+    log::set_max_level(max);
 }

@@ -119,6 +119,12 @@ pub async fn wifi_task(
                 log::info!("Wifi reconnect requested, disconnecting to pick up new settings...");
                 reset_counter(&wifi_nvs, NVS_KEY_CONNECT_SUCCESS_COUNT);
                 reset_counter(&wifi_nvs, NVS_KEY_CONNECT_FAIL_COUNT);
+                // No longer `Connected` *before* the websocket is closed, so
+                // `websocket_task` (which only waits for exactly that) doesn't
+                // reconnect it during the `disconnect().await` below. Closed
+                // while the link is still up, so it goes cleanly.
+                global.borrow_mut().wifi_status.status = WifiConnectionStatus::Connecting;
+                crate::websocket::close_websocket(&global);
                 if let Err(e) = wifi.disconnect().await {
                     log::error!("Wifi disconnect failed: {e:?}");
                 }

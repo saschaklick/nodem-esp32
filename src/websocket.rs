@@ -164,7 +164,7 @@ pub async fn websocket_task(global: Rc<RefCell<Global>>, nvs: EspDefaultNvsParti
             },
         );
 
-        let mut client = match client {
+        let client = match client {
             Ok(client) => client,
             Err(e) => {
                 log::error!("Websocket client creation failed: {e:?}");
@@ -190,20 +190,31 @@ pub async fn websocket_task(global: Rc<RefCell<Global>>, nvs: EspDefaultNvsParti
         // rather than trusting `is_connected()` alone.
         let mut last_ping = Instant::now();
 
+        // Kept in `Global` rather than here, so whatever is about to take
+        // Wi-Fi down (`wifi_task`'s reconnect, a restart) can close it
+        // cleanly first - see `close_websocket`. Gone from there means exactly
+        // that happened: back to waiting for Wi-Fi.
+        global.borrow_mut().ws_client = Some(client);
+
         loop {
             Timer::after_millis(20).await;
 
             while let Ok(message) = message_rx.try_recv() {
-                handle_incoming_message(&global, &mut command_listener, &mut client, &message);
+                handle_incoming_message(&global, &mut command_listener, &message);
             }
 
-            if client.is_connected() && last_ping.elapsed() >= embassy_time::Duration::from_secs(10) {
+            let Some(connected) = global.borrow().ws_client.as_ref().map(EspWebSocketClient::is_connected) else {
+                global.borrow_mut().cloud_status.connection = CloudConnectionStatus::Disconnected;
+                break;
+            };
+
+            if connected && last_ping.elapsed() >= embassy_time::Duration::from_secs(10) {
                 last_ping = Instant::now();
 
                 let ping = format!("ping,{}", Instant::now().as_secs());
-                if let Err(e) = client.send(FrameType::Text(false), ping.as_bytes()) {
+                if let Err(e) = send_text(&global, &ping) {
                     log::error!("Failed to send websocket ping, reconnecting: {e:?}");
-                    drop(client);
+                    close_websocket(&global);
                     global.borrow_mut().cloud_status.connection = CloudConnectionStatus::Disconnected;
                     break;
                 }
@@ -215,7 +226,7 @@ pub async fn websocket_task(global: Rc<RefCell<Global>>, nvs: EspDefaultNvsParti
                 // The actual NVS wipe (device id/secret) happens in
                 // `ensure_device_credentials`, driven by the fresh registration
                 // code this flag was set in response to - just get back there.
-                drop(client);
+                close_websocket(&global);
 
                 let mut g = global.borrow_mut();
                 g.cloud_status.registration = RegistrationStatus::Registering;
@@ -223,7 +234,7 @@ pub async fn websocket_task(global: Rc<RefCell<Global>>, nvs: EspDefaultNvsParti
                 break;
             }
 
-            global.borrow_mut().cloud_status.connection = if client.is_connected() {
+            global.borrow_mut().cloud_status.connection = if connected {
                 CloudConnectionStatus::Connected
             } else {
                 CloudConnectionStatus::Disconnected
@@ -242,7 +253,6 @@ pub async fn websocket_task(global: Rc<RefCell<Global>>, nvs: EspDefaultNvsParti
 fn handle_incoming_message(
     global: &Rc<RefCell<Global>>,
     command_listener: &mut CommandListener,
-    client: &mut EspWebSocketClient,
     message: &[u8],
 ) {
     let mut remaining = message;
@@ -267,8 +277,8 @@ fn handle_incoming_message(
             if let Some(iled_config) = command_listener.take_iled_config() {
                 g.iled_config = iled_config;
             }
-            if let Some(pkg_reload) = command_listener.take_pkg_reload() {
-                g.pkg_reload = Some(pkg_reload);
+            if command_listener.take_pkg_updated() {
+                g.pkg_reload = true;
             }
 
             ret
@@ -280,7 +290,7 @@ fn handle_incoming_message(
         }
 
         if !response.is_empty() {
-            if let Err(e) = client.send(FrameType::Text(false), response.as_bytes()) {
+            if let Err(e) = send_text(global, &response) {
                 log::error!("Failed to send websocket response: {e:?}");
             }
         }
@@ -289,7 +299,7 @@ fn handle_incoming_message(
         // to the client - `restart()` never returns.
         if restart {
             log::info!("Reset requested, restarting...");
-            esp_idf_svc::hal::reset::restart();
+            self::restart(global);
         }
 
         if consumed == 0 {
@@ -297,6 +307,37 @@ fn handle_incoming_message(
         }
         remaining = &remaining[consumed.min(remaining.len())..];
     }
+}
+
+/// Sends `text` over the websocket, if there currently is one.
+fn send_text(global: &RefCell<Global>, text: &str) -> Result<(), EspIOError> {
+    match global.borrow_mut().ws_client.as_mut() {
+        Some(client) => client.send(FrameType::Text(false), text.as_bytes()).map_err(EspIOError),
+        None => Ok(()),
+    }
+}
+
+/// Closes the websocket cleanly - a close frame, and waiting (up to the
+/// client's 10s timeout) for the server's reply - which is what dropping an
+/// `EspWebSocketClient` does. Call before anything takes Wi-Fi down
+/// (`wifi.disconnect()`, a restart): once the link is gone, the connection
+/// can only be aborted, which the server just sees as a dropped TCP
+/// connection. `websocket_task` notices the client is gone and starts over
+/// from waiting for Wi-Fi.
+pub(crate) fn close_websocket(global: &RefCell<Global>) {
+    // Taken out first, then dropped with `global` no longer borrowed.
+    let client = global.borrow_mut().ws_client.take();
+    if let Some(client) = client {
+        log::info!("Closing websocket...");
+        drop(client);
+    }
+}
+
+/// `restart()`, but with the websocket closed cleanly first - see
+/// `close_websocket`.
+pub(crate) fn restart(global: &RefCell<Global>) -> ! {
+    close_websocket(global);
+    esp_idf_svc::hal::reset::restart()
 }
 
 /// Extracts a `Text`/`Binary` websocket event's payload and hands it to

@@ -1,0 +1,10 @@
+# Release: two equal 1.4MB (0x160000) OTA slots, pkg takes the rest of the
+# 4MB flash. Keep `pkg`'s offset in sync with partitions.debug.csv so a pkg
+# flashed under one profile's firmware stays valid under the other's.
+# Name,   Type, SubType, Offset,   Size,     Flags
+nvs,      data, nvs,     0x9000,   0x4000,
+otadata,  data, ota,     0xd000,   0x2000,
+phy_init, data, phy,     0xf000,   0x1000,
+ota_0,    app,  ota_0,   0x10000,  0x160000,
+ota_1,    app,  ota_1,   0x170000, 0x160000,
+pkg,      data, spiffs,  0x2d0000, 0x130000,
