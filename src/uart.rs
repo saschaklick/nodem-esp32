@@ -72,7 +72,7 @@ pub async fn uart_task(
                 log_uart_recv(&g.command_buf[pos..pos + n]);
                 g.command_buf_pos += n;
                 let pos = g.command_buf_pos;
-                interrupt.update_status(&g.wifi_status, &g.cloud_status);
+                interrupt.update_status(&g);
                 let ret = g.runtime.process_command(&g.command_buf[..pos], uart.driver_mut(), &mut interrupt);
 
                 // `interrupt` can't reach into `global` itself (see its doc

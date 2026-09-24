@@ -262,7 +262,7 @@ fn handle_incoming_message(
 
         let (consumed, write_result) = {
             let mut g = global.borrow_mut();
-            command_listener.update_status(&g.wifi_status, &g.cloud_status);
+            command_listener.update_status(&g);
             let ret = g.runtime.process_command(remaining, &mut response, command_listener);
 
             if command_listener.take_wifi_reconnect() {

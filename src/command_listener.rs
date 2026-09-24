@@ -4,7 +4,7 @@ use esp_idf_svc::sys::{self, esp, esp_ota_handle_t, esp_partition_t};
 
 use nodem_rs::{ control::{ Control, ControlMode, IControl, IControlLoader, LoaderRet }, media::Media };
 
-use crate::global::{CloudConnectionStatus, CloudStatus, RegistrationStatus, WifiConnectionStatus, WifiStatus};
+use crate::global::{CloudConnectionStatus, CloudStatus, Global, OledConnectionStatus, OledStatus, RegistrationStatus, WifiConnectionStatus, WifiStatus};
 use crate::iled::{self, IledConfig};
 use crate::nodem::{self, NodemConfig};
 use crate::oled::{self, OledConfig};
@@ -60,12 +60,16 @@ pub(crate) struct CommandListener {
     // `Global::oled_config` right away - same double `Option` as
     // `iled_config`, the inner `None` meaning the display is disabled.
     oled_config: Option<Option<OledConfig>>,
-    // Snapshot of `Global::wifi_status`/`cloud_status`, refreshed by
-    // `update_status` right before each `process_command` call (same reason
-    // this doesn't hold `Global` itself - see the struct doc comment) so the
-    // "#stat" command below has something to report.
+    // Snapshot of `Global::wifi_status`/`cloud_status`/`oled_status` and the
+    // live iLED/OLED configs, refreshed by `update_status` right before each
+    // `process_command` call (same reason this doesn't hold `Global` itself -
+    // see the struct doc comment) so the "#stat" command below has something
+    // to report.
     wifi_status: WifiStatus,
     cloud_status: CloudStatus,
+    oled_status: OledStatus,
+    live_oled_config: Option<OledConfig>,
+    live_iled_config: Option<IledConfig>,
     // Backing store for "pkg" uploads (see `pkg_start` below).
     pkg_partition: Option<EspPartition>,
     // Absolute offset in the "pkg" partition of the next byte to be written.
@@ -106,6 +110,9 @@ impl CommandListener {
             oled_config: None,
             wifi_status: WifiStatus::new(),
             cloud_status: CloudStatus::new(),
+            oled_status: OledStatus::new(),
+            live_oled_config: None,
+            live_iled_config: None,
             pkg_partition: None,
             pkg_written: 0,
             pkg_updated: false,
@@ -149,9 +156,12 @@ impl CommandListener {
         core::mem::take(&mut self.pkg_updated)
     }
 
-    pub(crate) fn update_status(&mut self, wifi_status: &WifiStatus, cloud_status: &CloudStatus) {
-        self.wifi_status = wifi_status.clone();
-        self.cloud_status = cloud_status.clone();
+    pub(crate) fn update_status(&mut self, g: &Global) {
+        self.wifi_status = g.wifi_status.clone();
+        self.cloud_status = g.cloud_status.clone();
+        self.oled_status = g.oled_status.clone();
+        self.live_oled_config = g.oled_config;
+        self.live_iled_config = g.iled_config;
     }
 
     fn store(&self, namespace: &str, key: &str, value: &str, min_len: usize, max_len: usize, ret: &mut Ret) {
@@ -423,11 +433,15 @@ impl IControl for CommandListener {
                     let _ = self.write_plain(res, nodem::NVS_NAMESPACE, nodem::NVS_KEY_CONFIG);
                     let _ = self.write_plain(res, oled::NVS_NAMESPACE, oled::NVS_KEY_CONFIG);
                 }
-                // Two CSV lines, one per status struct - the last field of
-                // each ("failed"'s error message) is left unescaped and thus
-                // may itself contain commas, so a parser should treat it as
-                // "everything from here to end of line" rather than a fixed
-                // column.
+                // Four CSV lines: wifi, cloud, oled and iled - the last field
+                // of each of the first three (an error message) is left
+                // unescaped and thus may itself contain commas, so a parser
+                // should treat it as "everything from here to end of line"
+                // rather than a fixed column. "oled,<on>,<w>x<h>,<i2c>" and
+                // "iled,<on>,<w>x<h>": <on> is 1/0 (configured or disabled),
+                // the resolution empty while off; <i2c> is "ok" or the
+                // `OledConnectionStatus` in words ("initializing", or the
+                // failure's error).
                 "stat" => {
                     let w = &self.wifi_status;
                     let (wifi_state, wifi_error) = match &w.status {
@@ -464,6 +478,24 @@ impl IControl for CommandListener {
                         c.host.as_deref().unwrap_or(""),
                         c.device_name.as_deref().unwrap_or(""),
                     );
+
+                    let _ = match self.live_oled_config {
+                        Some(o) => {
+                            let i2c = match &self.oled_status.status {
+                                OledConnectionStatus::Connected => "ok",
+                                OledConnectionStatus::Initializing => "initializing",
+                                OledConnectionStatus::Disabled => "disabled",
+                                OledConnectionStatus::Failed(e) => e.as_str(),
+                            };
+                            write!(res, "oled,1,{}x{},{i2c}\r\n", o.width, o.height)
+                        }
+                        None => write!(res, "oled,0,,\r\n"),
+                    };
+
+                    let _ = match self.live_iled_config {
+                        Some(i) => write!(res, "iled,1,{}x{}\r\n", i.width, i.height),
+                        None => write!(res, "iled,0,\r\n"),
+                    };
                 }
                 "nvs" => {
                     let _ = self.write_all_entries(res);
