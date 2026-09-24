@@ -305,13 +305,16 @@ impl Global {
         }
     }
 
-    /// Swaps in a fresh, blank `display_buffer` of `nodem_config`'s size and
-    /// points the DOM's `Surface` at it - it redraws everything every frame,
-    /// so the next `run()` renders the current page at the new size. The new
-    /// buffer is pointed to before the old one is dropped, so `Surface` never
-    /// holds a dangling pointer.
+    /// Applies a new `nodem_config`. Device mappings take effect on their
+    /// own (each driver's `DriverView` reads them every frame); only if the
+    /// geometry changed is a fresh, blank `display_buffer` of the new size
+    /// swapped in and the DOM's `Surface` pointed at it - it redraws
+    /// everything every frame, so the next `run()` renders the current page
+    /// at the new size. The new buffer is pointed to before the old one is
+    /// dropped, so `Surface` never holds a dangling pointer.
     pub fn resize_display(&mut self, nodem_config: NodemConfig) {
-        if nodem_config == self.nodem_config {
+        if nodem_config.same_geometry(&self.nodem_config) {
+            self.nodem_config = nodem_config;
             return;
         }
         let mut display_buffer = vec![0u8; nodem_config.buffer_len()].into_boxed_slice();
@@ -325,12 +328,13 @@ impl Global {
     /// Whether pixel `(x, y)` of `display_buffer` is set - 1 bit/pixel,
     /// packed row-major and MSB-first exactly as `nodem_rs::Surface` draws
     /// it. Anything outside `nodem_config`'s `width`x`height` reads as off,
-    /// so a display bigger than the framebuffer just shows blank beyond it.
-    pub fn display_pixel(&self, x: usize, y: usize) -> bool {
-        if x >= self.nodem_config.width as usize || y >= self.nodem_config.height as usize {
+    /// negative coordinates included - see `driver::DriverView`, the only
+    /// caller, which maps a driver's pixels into here.
+    pub fn display_pixel(&self, x: i32, y: i32) -> bool {
+        if x < 0 || y < 0 || x >= self.nodem_config.width as i32 || y >= self.nodem_config.height as i32 {
             return false;
         }
-        let i = y * self.nodem_config.width as usize + x;
+        let i = y as usize * self.nodem_config.width as usize + x as usize;
         (self.display_buffer[i / 8] >> (7 - i % 8)) & 1 != 0
     }
 }

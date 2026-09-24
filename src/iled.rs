@@ -10,6 +10,7 @@ use esp_idf_svc::hal::i2s::config::{
 use esp_idf_svc::hal::i2s::{I2sDriver, I2sTx, I2S0};
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
 
+use crate::driver::{DriverKind, DriverView};
 use crate::global::{Global, DISPLAY_BUFFER_ILED};
 
 // pub(crate): `command_listener::CommandListener` writes
@@ -815,17 +816,16 @@ impl Framebuffer {
     }
 }
 
-/// Crops the top-left `config.width`x`config.height` corner of the shared
-/// nodem DOM framebuffer (`Global::display_buffer`, read through
-/// `Global::display_pixel`) into the framebuffer, pixel for pixel: LED
-/// framebuffer pixel `(x, y)` is exactly DOM pixel `(x, y)`, no scaling or
-/// sampling. Both sides are already monochrome (on/off), so this is a direct
-/// copy of that one bit, no thresholding or color conversion needed. An LED
-/// beyond the DOM's own `NodemConfig` size just stays off.
+/// Fills the `config.width`x`config.height` LED framebuffer from the nodem
+/// DOM framebuffer, through the "iled" `DeviceMapping` in `#nodem` (or the
+/// fallback frame, without one) - see `DriverView`. Both sides are already
+/// monochrome (on/off), so this is a direct copy of that one bit, no
+/// thresholding or color conversion needed.
 fn sample_from_dom(fb: &mut Framebuffer, config: &IledConfig, g: &Global) {
+    let view = DriverView::new(g, DriverKind::Iled, config.width, config.height);
     for y in 0..config.height {
         for x in 0..config.width {
-            fb.set(x, y, g.display_pixel(x, y));
+            fb.set(x, y, view.pixel(x, y));
         }
     }
 }

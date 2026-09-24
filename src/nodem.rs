@@ -9,6 +9,7 @@ use nodem_rs::media::Ret;
 use nodem_rs::runtime::Runtime;
 
 use crate::command_listener::{CommandListener, PKG_PARTITION_LABEL};
+use crate::driver::{DeviceMapping, DriverKind, MAX_DEVICES};
 use crate::global::{CloudConnectionStatus, Global, WifiConnectionStatus, DISPLAY_BUFFER_CONSUMERS};
 
 /// How long Wi-Fi and cloud both need to have been continuously connected
@@ -29,30 +30,47 @@ pub(crate) const NVS_KEY_CONFIG: &str = "nodem";
 /// every coordinate well within `nodem_rs`'s `PosX`/`PosY` (`i16`).
 const MAX_DIMENSION: u16 = 1024;
 
-/// Shape of the nodem DOM framebuffer (`Global::display_buffer`), persisted as
-/// `NVS_KEY_CONFIG` in the form "<width>:<height>:<bits_per_pixel>", e.g.
-/// "128:64:1". Only 1 bit/pixel is supported for now. The framebuffer and the
-/// DOM's `Surface` are sized from it in `Global::new` at boot, and resized
-/// live by `Global::resize_display` whenever "#nodem"/"#factory" writes it.
+/// Longest `NodemConfig::to_nvs_string` can get: the geometry plus
+/// `MAX_DEVICES` entries of at most "oled:-32768:-32768:255:255".
+pub(crate) const NVS_VALUE_MAX_LEN: usize = 16 + MAX_DEVICES * 28;
+
+/// Shape of the nodem DOM framebuffer (`Global::display_buffer`) and which
+/// drivers show which part of it, persisted as `NVS_KEY_CONFIG` in the form
+/// "<width>:<height>:<bits_per_pixel>[,<device>...]", e.g.
+/// "128:64:1,oled:0:0:1:1". Only 1 bit/pixel is supported for now. Each
+/// `<device>` is a `DeviceMapping` (up to `MAX_DEVICES`, one per driver); a
+/// driver without one gets nothing from nodem and shows `DriverView`'s
+/// fallback frame instead. The framebuffer and the DOM's `Surface` are sized
+/// from it in `Global::new` at boot, and it's applied live by
+/// `Global::resize_display` whenever "#nodem"/"#factory" writes it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct NodemConfig {
     pub width: u16,
     pub height: u16,
     pub bits_per_pixel: u8,
+    pub devices: [Option<DeviceMapping>; MAX_DEVICES],
 }
 
 impl Default for NodemConfig {
+    /// "128:64:1,oled:0:0:1:1" - the OLED mapped pixel for pixel, so a fresh
+    /// or factory-reset device still shows its status on it.
     fn default() -> Self {
-        Self { width: 128, height: 64, bits_per_pixel: 1 }
+        let mut devices = [None; MAX_DEVICES];
+        devices[0] = Some(DeviceMapping { driver: DriverKind::Oled, x: 0, y: 0, scale_x: 1, scale_y: 1 });
+        Self { width: 128, height: 64, bits_per_pixel: 1, devices }
     }
 }
 
 impl NodemConfig {
-    /// `None` for anything but exactly three colon-separated fields, a
-    /// `width`/`height` outside `1..=MAX_DIMENSION`, or a `bits_per_pixel`
-    /// other than 1.
+    /// `None` for a geometry that isn't exactly three colon-separated
+    /// fields, a `width`/`height` outside `1..=MAX_DIMENSION`, a
+    /// `bits_per_pixel` other than 1, more than `MAX_DEVICES` devices, a
+    /// device `DeviceMapping::parse` rejects, or a driver mapped twice.
+    /// Empty device fields (e.g. a trailing comma) are skipped.
     pub(crate) fn parse(s: &str) -> Option<Self> {
-        let mut fields = s.split(':').map(str::trim);
+        let mut entries = s.split(',').map(str::trim);
+
+        let mut fields = entries.next()?.split(':').map(str::trim);
         let width: u16 = fields.next()?.parse().ok()?;
         let height: u16 = fields.next()?.parse().ok()?;
         let bits_per_pixel: u8 = fields.next()?.parse().ok()?;
@@ -64,11 +82,36 @@ impl NodemConfig {
             return None;
         }
 
-        Some(Self { width, height, bits_per_pixel })
+        let mut devices = [None; MAX_DEVICES];
+        let mut count = 0;
+        for entry in entries.filter(|e| !e.is_empty()) {
+            let device = DeviceMapping::parse(entry)?;
+            if count == MAX_DEVICES || devices.iter().flatten().any(|d: &DeviceMapping| d.driver == device.driver) {
+                return None;
+            }
+            devices[count] = Some(device);
+            count += 1;
+        }
+
+        Some(Self { width, height, bits_per_pixel, devices })
     }
 
     pub(crate) fn to_nvs_string(&self) -> String {
-        format!("{}:{}:{}", self.width, self.height, self.bits_per_pixel)
+        let mut s = format!("{}:{}:{}", self.width, self.height, self.bits_per_pixel);
+        for device in self.devices.iter().flatten() {
+            s.push(',');
+            s.push_str(&device.to_nvs_string());
+        }
+        s
+    }
+
+    /// Whether the framebuffer itself differs - `devices` aside.
+    pub(crate) fn same_geometry(&self, other: &Self) -> bool {
+        (self.width, self.height, self.bits_per_pixel) == (other.width, other.height, other.bits_per_pixel)
+    }
+
+    pub(crate) fn mapping(&self, driver: DriverKind) -> Option<DeviceMapping> {
+        self.devices.iter().flatten().find(|d| d.driver == driver).copied()
     }
 
     /// Framebuffer size in bytes - pixels are packed contiguously, row after
@@ -91,7 +134,7 @@ pub(crate) fn read_nodem_config(nvs: EspDefaultNvsPartition) -> NodemConfig {
         }
     };
 
-    let mut buf = [0u8; 32];
+    let mut buf = [0u8; NVS_VALUE_MAX_LEN + 1];
     let raw = nvs.get_str(NVS_KEY_CONFIG, &mut buf).ok().flatten();
 
     if let Some(config) = raw.and_then(NodemConfig::parse) {

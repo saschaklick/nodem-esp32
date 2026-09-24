@@ -12,6 +12,7 @@ use esp_idf_svc::timer::EspTaskTimerService;
 use esp_idf_svc::wifi::{AsyncWifi, EspWifi};
 
 mod command_listener;
+mod driver;
 mod global;
 mod heartbeat;
 mod iled;

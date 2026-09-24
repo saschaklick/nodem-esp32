@@ -237,7 +237,7 @@ impl CommandListener {
     }
 
     fn write_plain(&self, res: &mut dyn core::fmt::Write, namespace: &str, key: &str) -> core::fmt::Result {
-        let mut buf = [0u8; 64];
+        let mut buf = [0u8; 256];
         let value = EspNvs::new(self.nvs.clone(), namespace, false).ok().and_then(|nvs| nvs.get_str(key, &mut buf).ok().flatten()).unwrap_or("");
         write!(res, "{key}={value}\r\n")
     }
@@ -271,7 +271,7 @@ impl IControl for CommandListener {
                     // the same value `read_nodem_config`/`read_iled_config`
                     // would write on a first boot. Like every NVS write here,
                     // each is mirrored into its runtime value right away.
-                    self.store(nodem::NVS_NAMESPACE, nodem::NVS_KEY_CONFIG, &NodemConfig::default().to_nvs_string(), 1, 32, &mut ret);
+                    self.store(nodem::NVS_NAMESPACE, nodem::NVS_KEY_CONFIG, &NodemConfig::default().to_nvs_string(), 1, nodem::NVS_VALUE_MAX_LEN, &mut ret);
                     self.store(iled::NVS_NAMESPACE, iled::NVS_KEY_CONFIG, &IledConfig::default().to_csv(), 1, 80, &mut ret);
                     self.store(oled::NVS_NAMESPACE, oled::NVS_KEY_CONFIG, &OledConfig::default().to_nvs_string(), 1, oled::NVS_VALUE_MAX_LEN, &mut ret);
                     self.nodem_config = Some(NodemConfig::default());
@@ -354,15 +354,18 @@ impl IControl for CommandListener {
                         None => ret = Ret::MalformedValue,
                     }
                 }
-                // "#nodem,<width>:<height>:<bits_per_pixel>" - the nodem
-                // framebuffer size, see `nodem::NodemConfig`. A bare "#nodem"
-                // resets it to `NodemConfig::default()`. Applied to the live
-                // framebuffer right away - see `Global::resize_display`.
+                // "#nodem,<width>:<height>:<bits_per_pixel>[,<device>...]",
+                // each <device> "<driver>:<x>:<y>:<scale_x>:<scale_y>" - the
+                // nodem framebuffer size and which drivers show which part
+                // of it, see `nodem::NodemConfig`. A bare "#nodem" resets it
+                // to `NodemConfig::default()`. Applied live right away - see
+                // `Global::resize_display`.
                 "nodem" => {
-                    let config = if arg_0.is_empty() { Some(NodemConfig::default()) } else { NodemConfig::parse(arg_0) };
+                    let value = args.trim();
+                    let config = if value.is_empty() { Some(NodemConfig::default()) } else { NodemConfig::parse(value) };
                     match config {
                         Some(config) => {
-                            self.store(nodem::NVS_NAMESPACE, nodem::NVS_KEY_CONFIG, &config.to_nvs_string(), 1, 32, &mut ret);
+                            self.store(nodem::NVS_NAMESPACE, nodem::NVS_KEY_CONFIG, &config.to_nvs_string(), 1, nodem::NVS_VALUE_MAX_LEN, &mut ret);
                             if ret == Ret::Ok { self.nodem_config = Some(config); }
                         }
                         None => ret = Ret::MalformedValue,

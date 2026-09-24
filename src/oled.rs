@@ -10,6 +10,7 @@ use ssd1306::size::{
 };
 use ssd1306::{I2CDisplayInterface, Ssd1306};
 
+use crate::driver::{DriverKind, DriverView};
 use crate::global::{Global, OledConnectionStatus, DISPLAY_BUFFER_OLED};
 
 // pub(crate): `command_listener::CommandListener` writes `NVS_KEY_CONFIG`
@@ -29,9 +30,15 @@ const MAX_FRAME_LEN: usize = 128 * 64 / 8;
 /// The I2C OLED, persisted as `NVS_KEY_CONFIG` in the form
 /// "<protocol>:<width>:<height>:<x>:<y>[:<rotation>]", e.g. the default
 /// "ssd1306:128:64:0:0". `ssd1306` is the only protocol; `width`/`height` is
-/// the panel's own size (one of `SSD1306_SIZES`), `x`/`y` the top-left point
-/// of the nodem framebuffer it shows, and `rotation` (0/90/180/270, clockwise,
-/// default 0) how that window is turned on the panel. An empty value or any
+/// the panel's own size (one of `SSD1306_SIZES`), `rotation` (0/90/180/270,
+/// clockwise, default 0) how the output is turned on the panel, and `x`/`y`
+/// a hardware offset into the SSD1306's own display RAM, on top of the
+/// crate's per-size `OFFSETX`/`OFFSETY` - where the draw area starts, for
+/// glass that doesn't sit where the crate assumes. `y` is in pixels but the
+/// controller addresses whole 8-pixel pages, so it must be a multiple of 8.
+/// Whatever would land past the controller's 128x64 RAM is cut off. Which
+/// part of the nodem framebuffer the output shows is a separate, software
+/// mapping: the "oled" device entry in "#nodem" - see `DriverView`. An empty value or any
 /// other protocol disables the display: it is neither initialized nor sent
 /// any data (`Global::oled_config` is `None`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -52,8 +59,9 @@ impl Default for OledConfig {
 impl OledConfig {
     /// `Ok(None)` for a disabled display (empty, or a protocol other than
     /// "ssd1306"); `Err(())` for an "ssd1306" value with missing/extra
-    /// fields, a size not in `SSD1306_SIZES`, or a rotation other than
-    /// 0/90/180/270.
+    /// fields, a size not in `SSD1306_SIZES`, an `x`/`y` outside the
+    /// controller's 128x64 RAM or a `y` that isn't a multiple of 8, or a
+    /// rotation other than 0/90/180/270.
     pub(crate) fn parse(s: &str) -> Result<Option<Self>, ()> {
         let mut fields = s.trim().split(':').map(str::trim);
         if fields.next() != Some("ssd1306") {
@@ -72,7 +80,12 @@ impl OledConfig {
             return Err(());
         }
 
-        if !SSD1306_SIZES.contains(&(width, height)) || ![0, 90, 180, 270].contains(&rotation) {
+        if !SSD1306_SIZES.contains(&(width, height))
+            || x >= 128
+            || y >= 64
+            || y % 8 != 0
+            || ![0, 90, 180, 270].contains(&rotation)
+        {
             return Err(());
         }
 
@@ -89,18 +102,30 @@ impl OledConfig {
         s
     }
 
-    /// Whether panel pixel `(px, py)` is lit: turned back by `rotation` into
-    /// the (unrotated) window, then offset by `x`/`y` into the nodem
-    /// framebuffer - see `Global::display_pixel` for what's outside it.
-    fn pixel(&self, g: &Global, px: usize, py: usize) -> bool {
+    /// The panel's size as seen after `rotation` - width and height swap
+    /// for 90/270.
+    fn rotated_size(&self) -> (usize, usize) {
         let (w, h) = (self.width as usize, self.height as usize);
-        let (sx, sy) = match self.rotation {
+        if self.rotation % 180 == 90 { (h, w) } else { (w, h) }
+    }
+
+    /// This frame's output, mapped into nodem as the "oled" device.
+    fn view<'a>(&self, g: &'a Global) -> DriverView<'a> {
+        let (w, h) = self.rotated_size();
+        DriverView::new(g, DriverKind::Oled, w, h)
+    }
+
+    /// Whether panel pixel `(px, py)` is lit: turned by `rotation` into
+    /// `view`'s coordinates.
+    fn pixel(&self, view: &DriverView, px: usize, py: usize) -> bool {
+        let (w, h) = (self.width as usize, self.height as usize);
+        let (rx, ry) = match self.rotation {
             90 => (py, w - 1 - px),
             180 => (w - 1 - px, h - 1 - py),
             270 => (h - 1 - py, px),
             _ => (px, py),
         };
-        g.display_pixel(self.x as usize + sx, self.y as usize + sy)
+        view.pixel(rx, ry)
     }
 }
 
@@ -197,7 +222,15 @@ async fn run_ssd1306<SIZE: DisplaySize>(
     // First frame goes out right away, dirty or not - the panel has just
     // been (re)initialized and shows nothing yet.
     let mut force = true;
-    let frame_len = config.width as usize * config.height as usize / 8;
+    // The draw area in display RAM: the crate's own offset for this panel
+    // size plus the configured hardware offset, cut off at the controller's
+    // RAM edge (`config.y` and every `height` are whole pages, so `pages`
+    // is too).
+    let start = (SIZE::OFFSETX.saturating_add(config.x as u8), SIZE::OFFSETY.saturating_add(config.y as u8));
+    let cols = (SIZE::WIDTH as usize).min((SIZE::DRIVER_COLS as usize).saturating_sub(start.0 as usize));
+    let pages = (SIZE::HEIGHT as usize).min((SIZE::DRIVER_ROWS as usize).saturating_sub(start.1 as usize)) / 8;
+    let end = (start.0 + cols as u8, start.1 + (pages * 8) as u8);
+    let frame_len = cols * pages;
     let mut frame = [0u8; MAX_FRAME_LEN];
 
     loop {
@@ -222,13 +255,14 @@ async fn run_ssd1306<SIZE: DisplaySize>(
         // at the top.
         {
             let g = global.borrow();
-            for page in 0..config.height as usize / 8 {
-                for col in 0..config.width as usize {
+            let view = config.view(&g);
+            for page in 0..pages {
+                for col in 0..cols {
                     let mut byte = 0u8;
                     for b in 0..8 {
-                        byte |= (config.pixel(&g, col, page * 8 + b) as u8) << b;
+                        byte |= (config.pixel(&view, col, page * 8 + b) as u8) << b;
                     }
-                    frame[page * config.width as usize + col] = byte;
+                    frame[page * cols + col] = byte;
                 }
             }
         }
@@ -237,9 +271,11 @@ async fn run_ssd1306<SIZE: DisplaySize>(
         let mut result = Ok(());
 
         for attempt in 1..=MAX_ATTEMPTS {
-            result = display
-                .set_draw_area((SIZE::OFFSETX, SIZE::OFFSETY), (SIZE::OFFSETX + SIZE::WIDTH, SIZE::OFFSETY + SIZE::HEIGHT))
-                .and_then(|()| display.draw(&frame[..frame_len]));
+            result = if frame_len == 0 {
+                Ok(())
+            } else {
+                display.set_draw_area(start, end).and_then(|()| display.draw(&frame[..frame_len]))
+            };
 
             match &result {
                 Ok(()) => break,
