@@ -203,7 +203,7 @@ fn set_status_message(runtime: &mut nodem_rs::runtime::DOM<'static>, message: Op
 }
 
 /// Loads the pkg stored in the "pkg" partition, if there is one, into the
-/// live `Media` (as source 2). Layout: b"PKG0" magic, then a native-endian u32
+/// live `Media` (as source 2) - or, if there isn't, unloads any loaded one. Layout: b"PKG0" magic, then a native-endian u32
 /// giving the pkg's total length (magic included) - see `Media::load_pkg`,
 /// which CRCs every byte up to that length.
 ///
@@ -229,7 +229,12 @@ fn load_pkg_partition(g: &mut Global, mapping: &mut Option<*const u8>) -> bool {
         return false;
     }
     if &header[0..4] != b"PKG0" {
-        log::info!("'{PKG_PARTITION_LABEL}' partition has no pkg, skipping load");
+        // Also what a "#factory" (which erases the header) lands on: drop
+        // whatever pkg was loaded, and the DOM built from its page - both
+        // point into the flash that no longer holds it.
+        log::info!("'{PKG_PARTITION_LABEL}' partition has no pkg, unloading");
+        g.runtime.surface.media.unload_pkg();
+        g.runtime.dom.clear();
         return false;
     }
     let len = u32::from_ne_bytes(header[4..8].try_into().unwrap()) as usize;

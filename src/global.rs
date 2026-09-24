@@ -5,6 +5,7 @@ use nodem_rs::runtime::DOM;
 
 use crate::iled::IledConfig;
 use crate::nodem::NodemConfig;
+use crate::oled::OledConfig;
 
 const COMMAND_BUF_LEN: usize = 1024;
 
@@ -172,10 +173,12 @@ impl std::fmt::Display for SysStatus {
 }
 
 /// Where `oled_task` currently is with the SSD1306 - `Failed` after the
-/// initial `init()` failed is permanent (`oled_task` gives up and returns),
+/// initial `init()` failed lasts until `Global::oled_config` changes,
 /// whereas after a failed reinitialization the next flush simply tries again.
+/// `Disabled` while `Global::oled_config` is `None`.
 #[derive(Clone)]
 pub enum OledConnectionStatus {
+    Disabled,
     Initializing,
     Connected,
     Failed(String),
@@ -205,6 +208,7 @@ impl OledStatus {
 impl std::fmt::Display for OledStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.status {
+            OledConnectionStatus::Disabled => write!(f, "OLED: disabled"),
             OledConnectionStatus::Initializing => write!(f, "OLED: initializing..."),
             OledConnectionStatus::Connected => write!(f, "OLED: connected"),
             OledConnectionStatus::Failed(e) => write!(f, "OLED: failed ({e})"),
@@ -256,6 +260,11 @@ pub struct Global {
     // back to `IledConfig::default()` the way every individually-blank
     // field does - see `command_listener`'s "#iled" handling.
     pub iled_config: Option<IledConfig>,
+    // Loaded from `oled::NVS_KEY_CONFIG` by `oled_task` at startup, then
+    // written by `uart_task`/`websocket_task` right after a "#oled"/"#factory",
+    // same pattern as `iled_config`. `None` means the display is disabled;
+    // `oled_task` re-initializes it whenever this changes.
+    pub oled_config: Option<OledConfig>,
     // Set (mirrored from `CommandListener::take_pkg_updated`) by `uart_task`/
     // `websocket_task` right after a "pkg" upload has been written to the
     // "pkg" partition, same pattern as `iled_config` above. Taken by
@@ -290,6 +299,7 @@ impl Global {
             wifi_reconnect: false,
             reregister: false,
             iled_config: Some(IledConfig::default()),
+            oled_config: None,
             pkg_reload: false,
             ws_client: None,
         }

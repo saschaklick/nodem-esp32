@@ -7,6 +7,7 @@ use nodem_rs::{ control::{ Control, ControlMode, IControl, IControlLoader, Loade
 use crate::global::{CloudConnectionStatus, CloudStatus, RegistrationStatus, WifiConnectionStatus, WifiStatus};
 use crate::iled::{self, IledConfig};
 use crate::nodem::{self, NodemConfig};
+use crate::oled::{self, OledConfig};
 use crate::websocket;
 use crate::wifi;
 
@@ -55,6 +56,10 @@ pub(crate) struct CommandListener {
     // Set by "#nodem"/"#factory" so callers can resize the live framebuffer
     // (`Global::resize_display`) right away, same pattern as `iled_config`.
     nodem_config: Option<NodemConfig>,
+    // Set by "#oled"/"#factory" so callers can mirror it into
+    // `Global::oled_config` right away - same double `Option` as
+    // `iled_config`, the inner `None` meaning the display is disabled.
+    oled_config: Option<Option<OledConfig>>,
     // Snapshot of `Global::wifi_status`/`cloud_status`, refreshed by
     // `update_status` right before each `process_command` call (same reason
     // this doesn't hold `Global` itself - see the struct doc comment) so the
@@ -98,6 +103,7 @@ impl CommandListener {
             restart: false,
             iled_config: None,
             nodem_config: None,
+            oled_config: None,
             wifi_status: WifiStatus::new(),
             cloud_status: CloudStatus::new(),
             pkg_partition: None,
@@ -133,6 +139,10 @@ impl CommandListener {
 
     pub(crate) fn take_nodem_config(&mut self) -> Option<NodemConfig> {
         core::mem::take(&mut self.nodem_config)
+    }
+
+    pub(crate) fn take_oled_config(&mut self) -> Option<Option<OledConfig>> {
+        core::mem::take(&mut self.oled_config)
     }
 
     pub(crate) fn take_pkg_updated(&mut self) -> bool {
@@ -179,6 +189,53 @@ impl CommandListener {
         res.write_str("\r\n")
     }
 
+    /// Every entry in the default NVS partition, across all namespaces
+    /// (ESP-IDF's own, e.g. "nvs.net80211", included), unmasked, one
+    /// "<namespace>/<key>=<value>" line each - blobs as their length only.
+    /// The iterator is drained into a list first, since reading the values
+    /// means opening each namespace, and released before that.
+    fn write_all_entries(&self, res: &mut dyn core::fmt::Write) -> core::fmt::Result {
+        let mut entries = Vec::new();
+        let mut it: sys::nvs_iterator_t = core::ptr::null_mut();
+        let mut err = unsafe { sys::nvs_entry_find(c"nvs".as_ptr(), core::ptr::null(), sys::nvs_type_t_NVS_TYPE_ANY, &mut it) };
+        while err == sys::ESP_OK {
+            let mut info = sys::nvs_entry_info_t::default();
+            unsafe { sys::nvs_entry_info(it, &mut info) };
+            let to_string = |s: &[core::ffi::c_char]| unsafe { core::ffi::CStr::from_ptr(s.as_ptr()) }.to_string_lossy().into_owned();
+            entries.push((to_string(&info.namespace_name), to_string(&info.key), info.type_));
+            err = unsafe { sys::nvs_entry_next(&mut it) };
+        }
+        unsafe { sys::nvs_release_iterator(it) };
+        if err != sys::ESP_ERR_NVS_NOT_FOUND {
+            log::error!("NVS entry iteration failed: {:?}", sys::EspError::from(err));
+        }
+
+        for (namespace, key, type_) in entries {
+            let Ok(nvs) = EspNvs::new(self.nvs.clone(), &namespace, false) else {
+                write!(res, "{namespace}/{key}=?\r\n")?;
+                continue;
+            };
+            let value = match type_ {
+                sys::nvs_type_t_NVS_TYPE_U8 => nvs.get_u8(&key).ok().flatten().map(|v| v.to_string()),
+                sys::nvs_type_t_NVS_TYPE_I8 => nvs.get_i8(&key).ok().flatten().map(|v| v.to_string()),
+                sys::nvs_type_t_NVS_TYPE_U16 => nvs.get_u16(&key).ok().flatten().map(|v| v.to_string()),
+                sys::nvs_type_t_NVS_TYPE_I16 => nvs.get_i16(&key).ok().flatten().map(|v| v.to_string()),
+                sys::nvs_type_t_NVS_TYPE_U32 => nvs.get_u32(&key).ok().flatten().map(|v| v.to_string()),
+                sys::nvs_type_t_NVS_TYPE_I32 => nvs.get_i32(&key).ok().flatten().map(|v| v.to_string()),
+                sys::nvs_type_t_NVS_TYPE_U64 => nvs.get_u64(&key).ok().flatten().map(|v| v.to_string()),
+                sys::nvs_type_t_NVS_TYPE_I64 => nvs.get_i64(&key).ok().flatten().map(|v| v.to_string()),
+                sys::nvs_type_t_NVS_TYPE_STR => nvs.str_len(&key).ok().flatten().and_then(|len| {
+                    let mut buf = vec![0u8; len.max(1)];
+                    nvs.get_str(&key, &mut buf).ok().flatten().map(str::to_string)
+                }),
+                sys::nvs_type_t_NVS_TYPE_BLOB => nvs.blob_len(&key).ok().flatten().map(|len| format!("<blob {len} bytes>")),
+                _ => None,
+            };
+            write!(res, "{namespace}/{key}={}\r\n", value.as_deref().unwrap_or("?"))?;
+        }
+        Ok(())
+    }
+
     fn write_plain(&self, res: &mut dyn core::fmt::Write, namespace: &str, key: &str) -> core::fmt::Result {
         let mut buf = [0u8; 64];
         let value = EspNvs::new(self.nvs.clone(), namespace, false).ok().and_then(|nvs| nvs.get_str(key, &mut buf).ok().flatten()).unwrap_or("");
@@ -216,7 +273,10 @@ impl IControl for CommandListener {
                     // each is mirrored into its runtime value right away.
                     self.store(nodem::NVS_NAMESPACE, nodem::NVS_KEY_CONFIG, &NodemConfig::default().to_nvs_string(), 1, 32, &mut ret);
                     self.store(iled::NVS_NAMESPACE, iled::NVS_KEY_CONFIG, &IledConfig::default().to_csv(), 1, 80, &mut ret);
+                    self.store(oled::NVS_NAMESPACE, oled::NVS_KEY_CONFIG, &OledConfig::default().to_nvs_string(), 1, oled::NVS_VALUE_MAX_LEN, &mut ret);
                     self.nodem_config = Some(NodemConfig::default());
+                    self.oled_config = Some(Some(OledConfig::default()));
+                    self.erase_pkg_header();
                     self.iled_config = Some(Some(IledConfig::default()));
                     self.device_name = Some(None);
                     self.wifi_reconnect = true;
@@ -308,6 +368,22 @@ impl IControl for CommandListener {
                         None => ret = Ret::MalformedValue,
                     }
                 }
+                // "#oled,<protocol>:<width>:<height>:<x>:<y>[:<rotation>]" -
+                // see `oled::OledConfig`. An empty value ("#oled") or any
+                // protocol other than "ssd1306" is stored as given and
+                // disables the display; a malformed "ssd1306" value is
+                // rejected. Applied right away (`Global::oled_config`).
+                "oled" => {
+                    let value = args.trim();
+                    match OledConfig::parse(value) {
+                        Ok(config) => {
+                            let stored = config.map(|c| c.to_nvs_string()).unwrap_or_else(|| value.to_string());
+                            self.store(oled::NVS_NAMESPACE, oled::NVS_KEY_CONFIG, &stored, 0, oled::NVS_VALUE_MAX_LEN, &mut ret);
+                            if ret == Ret::Ok { self.oled_config = Some(config); }
+                        }
+                        Err(()) => ret = Ret::MalformedValue,
+                    }
+                }
                 // No value ("#host" with nothing after it, or an empty field)
                 // clears back to `websocket::DEFAULT_CLOUD_HOST` rather than
                 // erroring. A device's registration (`NVS_KEY_DEVICE_ID`/
@@ -342,6 +418,7 @@ impl IControl for CommandListener {
                     let _ = self.write_plain(res, iled::NVS_NAMESPACE, iled::NVS_KEY_CONFIG);
                     let _ = self.write_plain(res, nodem::NVS_NAMESPACE, nodem::NVS_KEY_LAST_PAGE);
                     let _ = self.write_plain(res, nodem::NVS_NAMESPACE, nodem::NVS_KEY_CONFIG);
+                    let _ = self.write_plain(res, oled::NVS_NAMESPACE, oled::NVS_KEY_CONFIG);
                 }
                 // Two CSV lines, one per status struct - the last field of
                 // each ("failed"'s error message) is left unescaped and thus
@@ -386,13 +463,7 @@ impl IControl for CommandListener {
                     );
                 }
                 "nvs" => {
-                    let _ = self.write_plain(res, wifi::NVS_NAMESPACE, wifi::NVS_KEY_SSID);
-                    let _ = self.write_plain(res, wifi::NVS_NAMESPACE, wifi::NVS_KEY_PASS);
-                    let _ = self.write_plain(res, websocket::NVS_NAMESPACE, websocket::NVS_KEY_DEVICE_NAME);
-                    let _ = self.write_plain(res, websocket::NVS_NAMESPACE, websocket::NVS_KEY_REGISTRATION_CODE);                    
-                    let _ = self.write_plain(res, websocket::NVS_NAMESPACE, websocket::NVS_KEY_CLOUD_HOST);
-                    let _ = self.write_plain(res, websocket::NVS_NAMESPACE, websocket::NVS_KEY_DEVICE_ID);
-                    let _ = self.write_plain(res, websocket::NVS_NAMESPACE, websocket::NVS_KEY_DEVICE_SECRET);
+                    let _ = self.write_all_entries(res);
                 }
                 _ => { ret = Ret::Error; }
             }
@@ -532,6 +603,30 @@ impl CommandListener {
 
         self.pkg_partition = Some(partition);
         size
+    }
+
+    /// Invalidates whatever pkg is in the "pkg" partition by erasing its
+    /// first erase block - enough to wipe the "PKG0" header, so
+    /// `nodem::load_pkg_partition` no longer finds one. Flags `pkg_updated`
+    /// so `nodem_task` drops the loaded pkg from the live runtime right away.
+    fn erase_pkg_header(&mut self) {
+        let mut partition = match unsafe { EspPartition::new(PKG_PARTITION_LABEL) } {
+            Ok(Some(partition)) => partition,
+            Ok(None) => {
+                log::error!("'{PKG_PARTITION_LABEL}' partition not found");
+                return;
+            }
+            Err(e) => {
+                log::error!("'{PKG_PARTITION_LABEL}' partition lookup failed: {e:?}");
+                return;
+            }
+        };
+        let erase_size = partition.erase_size();
+        if let Err(e) = partition.erase(0, erase_size) {
+            log::error!("'{PKG_PARTITION_LABEL}' partition erase failed: {e:?}");
+            return;
+        }
+        self.pkg_updated = true;
     }
 
     fn pkg_write(&mut self, len: usize) -> bool {

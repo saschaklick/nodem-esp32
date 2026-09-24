@@ -49,7 +49,7 @@ pub(crate) const NVS_KEY_DEVICE_NAME: &str = "device_name";
 // stored name against these same bounds before registering with it.
 pub(crate) const DEVICE_NAME_MIN_LEN: usize = 3;
 pub(crate) const DEVICE_NAME_MAX_LEN: usize = 64;
-// pub(crate): read (unmasked) by `uart_task`'s "#nvs" debug dump.
+// pub(crate): removed by "#factory"/"#host" (`command_listener`).
 pub(crate) const NVS_KEY_DEVICE_ID: &str = "device_id";
 pub(crate) const NVS_KEY_DEVICE_SECRET: &str = "device_secret";
 // pub(crate): `uart_task`'s "#host" command writes/removes this - see
@@ -276,6 +276,9 @@ fn handle_incoming_message(
             }
             if let Some(nodem_config) = command_listener.take_nodem_config() {
                 g.resize_display(nodem_config);
+            }
+            if let Some(oled_config) = command_listener.take_oled_config() {
+                g.oled_config = oled_config;
             }
             if let Some(iled_config) = command_listener.take_iled_config() {
                 g.iled_config = iled_config;

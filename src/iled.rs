@@ -15,7 +15,8 @@ use crate::global::{Global, DISPLAY_BUFFER_ILED};
 // pub(crate): `command_listener::CommandListener` writes
 // `NVS_KEY_CONFIG` when "#iled" successfully parses - see
 // `IledConfig::parse`/`to_csv`.
-pub(crate) const NVS_NAMESPACE: &str = "iled";
+// Shared with `oled` - both keep their config in the "drivers" namespace.
+pub(crate) const NVS_NAMESPACE: &str = "drivers";
 pub(crate) const NVS_KEY_CONFIG: &str = "iled";
 
 /// Hard cap on `IledConfig::width * height`. `FRAME_LEN`/the I2S channel's
@@ -466,9 +467,10 @@ pub struct IledConfig {
 }
 
 impl Default for IledConfig {
-    /// Matches "#iled,,,,": every field at its own empty-input default
-    /// (1x1, `HEdge::Left`/`VEdge::Top`/`Axis::Row`, not serpentine, all-off
-    /// off) plus `DEFAULT_PROTOCOL` for the entirely-blank protocol field,
+    /// Matches "#iled,1:1:i,,,": every field at its own empty-input default
+    /// (1x1, `HEdge::Left`/`VEdge::Top`/`Axis::Row`, all-off off) except
+    /// serpentine wiring, which is on ("i" - an empty layout leaves it off),
+    /// plus `DEFAULT_PROTOCOL` for the entirely-blank protocol field,
     /// which is `TimingConfig::default()`/`ColorPattern::default()`'s
     /// "1110"/"1000" pattern, 1250ns/600ns timing and "g8r8b8w8" wire layout,
     /// and rgb(16, 0, 0) on. 1x1 rather than some larger
@@ -480,7 +482,7 @@ impl Default for IledConfig {
         Self {
             width: 1,
             height: 1,
-            layout: ChainLayout { h_edge: HEdge::Left, v_edge: VEdge::Top, axis: Axis::Row, serpentine: false },
+            layout: ChainLayout { h_edge: HEdge::Left, v_edge: VEdge::Top, axis: Axis::Row, serpentine: true },
             on_color: (16, 0, 0, 0, 0),
             off_color: (0, 0, 0, 0, 0),
             timing: TimingConfig::default(),

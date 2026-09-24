@@ -83,7 +83,7 @@ fn main() -> anyhow::Result<()> {
     executor.spawn(heartbeat::heartbeat_task(global.clone())).detach();
     executor.spawn(iled::iled_task(global.clone(), nvs.clone())).detach();
     executor.spawn(nodem::nodem_task(global.clone(), nvs.clone())).detach();
-    executor.spawn(oled::oled_task(i2c, global.clone())).detach();
+    executor.spawn(oled::oled_task(i2c, global.clone(), nvs.clone())).detach();
     executor.spawn(uart::uart_task(uart, global.clone(), nvs.clone())).detach();
     executor.spawn(websocket::websocket_task(global.clone(), nvs.clone())).detach();
     executor.spawn(wifi::wifi_task(&mut wifi, global, nvs)).detach();

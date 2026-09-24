@@ -90,6 +90,9 @@ pub async fn uart_task(
                 if let Some(nodem_config) = interrupt.take_nodem_config() {
                     g.resize_display(nodem_config);
                 }
+                if let Some(oled_config) = interrupt.take_oled_config() {
+                    g.oled_config = oled_config;
+                }
                 if let Some(iled_config) = interrupt.take_iled_config() {
                     g.iled_config = iled_config;
                 }
