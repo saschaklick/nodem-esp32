@@ -6,7 +6,7 @@ use nodem_rs::{ control::{ Control, ControlMode, IControl, IControlLoader, Loade
 
 use crate::global::{CloudConnectionStatus, CloudStatus, RegistrationStatus, WifiConnectionStatus, WifiStatus};
 use crate::iled::{self, IledConfig};
-use crate::nodem;
+use crate::nodem::{self, NodemConfig};
 use crate::websocket;
 use crate::wifi;
 
@@ -35,9 +35,11 @@ pub(crate) struct CommandListener {
     nvs: EspDefaultNvsPartition,
     wifi_reconnect: bool,
     reregister: bool,
-    // Set by "#name" so callers can mirror it into `Global::cloud_status`
-    // right away, same reason/pattern as `wifi_reconnect`/`reregister` above.
-    device_name: Option<String>,
+    // Set by "#name"/"#reg" (`Some(Some(name))`) and "#factory" (`Some(None)`,
+    // the name having been removed) so callers can mirror it into
+    // `Global::cloud_status` right away, same reason/pattern as
+    // `wifi_reconnect`/`reregister` above.
+    device_name: Option<Option<String>>,
     // Set by "#reset" - taken (and acted on) by callers only once the ack
     // this produces has actually been sent, same reason/pattern as
     // `wifi_reconnect`/`reregister` above.
@@ -50,6 +52,9 @@ pub(crate) struct CommandListener {
     // `None` to disable the feature (a bare "#iled" - see its handling in
     // `process_line`).
     iled_config: Option<Option<IledConfig>>,
+    // Set by "#nodem"/"#factory" so callers can resize the live framebuffer
+    // (`Global::resize_display`) right away, same pattern as `iled_config`.
+    nodem_config: Option<NodemConfig>,
     // Snapshot of `Global::wifi_status`/`cloud_status`, refreshed by
     // `update_status` right before each `process_command` call (same reason
     // this doesn't hold `Global` itself - see the struct doc comment) so the
@@ -92,6 +97,7 @@ impl CommandListener {
             device_name: None,
             restart: false,
             iled_config: None,
+            nodem_config: None,
             wifi_status: WifiStatus::new(),
             cloud_status: CloudStatus::new(),
             pkg_partition: None,
@@ -113,7 +119,7 @@ impl CommandListener {
         core::mem::take(&mut self.reregister)
     }
 
-    pub(crate) fn take_device_name(&mut self) -> Option<String> {
+    pub(crate) fn take_device_name(&mut self) -> Option<Option<String>> {
         core::mem::take(&mut self.device_name)
     }
 
@@ -123,6 +129,10 @@ impl CommandListener {
 
     pub(crate) fn take_iled_config(&mut self) -> Option<Option<IledConfig>> {
         core::mem::take(&mut self.iled_config)
+    }
+
+    pub(crate) fn take_nodem_config(&mut self) -> Option<NodemConfig> {
+        core::mem::take(&mut self.nodem_config)
     }
 
     pub(crate) fn take_pkg_updated(&mut self) -> bool {
@@ -200,6 +210,15 @@ impl IControl for CommandListener {
                     self.remove(websocket::NVS_NAMESPACE, websocket::NVS_KEY_DEVICE_SECRET);
                     self.remove(websocket::NVS_NAMESPACE, websocket::NVS_KEY_CLOUD_HOST);
                     self.remove(nodem::NVS_NAMESPACE, nodem::NVS_KEY_LAST_PAGE);
+                    // Keys with a default are reset to it rather than removed,
+                    // the same value `read_nodem_config`/`read_iled_config`
+                    // would write on a first boot. Like every NVS write here,
+                    // each is mirrored into its runtime value right away.
+                    self.store(nodem::NVS_NAMESPACE, nodem::NVS_KEY_CONFIG, &NodemConfig::default().to_nvs_string(), 1, 32, &mut ret);
+                    self.store(iled::NVS_NAMESPACE, iled::NVS_KEY_CONFIG, &IledConfig::default().to_csv(), 1, 80, &mut ret);
+                    self.nodem_config = Some(NodemConfig::default());
+                    self.iled_config = Some(Some(IledConfig::default()));
+                    self.device_name = Some(None);
                     self.wifi_reconnect = true;
                     self.reregister = true;
                 }
@@ -232,11 +251,14 @@ impl IControl for CommandListener {
                             self.store(websocket::NVS_NAMESPACE, websocket::NVS_KEY_DEVICE_NAME, arg_1, websocket::DEVICE_NAME_MIN_LEN, websocket::DEVICE_NAME_MAX_LEN, &mut ret);
                         }
                     }
-                    if ret == Ret::Ok { self.reregister = true; }
+                    if ret == Ret::Ok {
+                        self.device_name = Some(Some(arg_1.to_string()));
+                        self.reregister = true;
+                    }
                 }
                 "name" => {
                     self.store(websocket::NVS_NAMESPACE, websocket::NVS_KEY_DEVICE_NAME, arg_0, websocket::DEVICE_NAME_MIN_LEN, websocket::DEVICE_NAME_MAX_LEN, &mut ret);
-                    if ret == Ret::Ok { self.device_name = Some(arg_0.to_string()); }
+                    if ret == Ret::Ok { self.device_name = Some(Some(arg_0.to_string())); }
                 }                
                 // "#iled,<geometry>,<protocol>,<color>,<off_color>", where
                 // <geometry> is itself "<width>:<height>:<layout>" and
@@ -268,6 +290,20 @@ impl IControl for CommandListener {
                         Some(config) => {
                             self.store(iled::NVS_NAMESPACE, iled::NVS_KEY_CONFIG, &config.to_csv(), 1, 80, &mut ret);
                             if ret == Ret::Ok { self.iled_config = Some(Some(config)); };
+                        }
+                        None => ret = Ret::MalformedValue,
+                    }
+                }
+                // "#nodem,<width>:<height>:<bits_per_pixel>" - the nodem
+                // framebuffer size, see `nodem::NodemConfig`. A bare "#nodem"
+                // resets it to `NodemConfig::default()`. Applied to the live
+                // framebuffer right away - see `Global::resize_display`.
+                "nodem" => {
+                    let config = if arg_0.is_empty() { Some(NodemConfig::default()) } else { NodemConfig::parse(arg_0) };
+                    match config {
+                        Some(config) => {
+                            self.store(nodem::NVS_NAMESPACE, nodem::NVS_KEY_CONFIG, &config.to_nvs_string(), 1, 32, &mut ret);
+                            if ret == Ret::Ok { self.nodem_config = Some(config); }
                         }
                         None => ret = Ret::MalformedValue,
                     }
@@ -305,6 +341,7 @@ impl IControl for CommandListener {
                     let _ = self.write_plain(res, websocket::NVS_NAMESPACE, websocket::NVS_KEY_CLOUD_HOST);
                     let _ = self.write_plain(res, iled::NVS_NAMESPACE, iled::NVS_KEY_CONFIG);
                     let _ = self.write_plain(res, nodem::NVS_NAMESPACE, nodem::NVS_KEY_LAST_PAGE);
+                    let _ = self.write_plain(res, nodem::NVS_NAMESPACE, nodem::NVS_KEY_CONFIG);
                 }
                 // Two CSV lines, one per status struct - the last field of
                 // each ("failed"'s error message) is left unescaped and thus

@@ -9,7 +9,10 @@ use ssd1306::{I2CDisplayInterface, Ssd1306};
 use crate::global::{Global, OledConnectionStatus, DISPLAY_BUFFER_OLED};
 
 /// Flushes `Global::display_buffer` to the SSD1306 over I2C (SDA=GPIO8, SCL=GPIO9)
-/// whenever `nodem_task` marks it dirty. Only clears its own
+/// whenever `nodem_task` marks it dirty. The panel is always 128x64; a
+/// framebuffer of any other `NodemConfig` size is shown from its top-left
+/// corner, cropped or padded with blank pixels (see `Global::display_pixel`).
+/// Only clears its own
 /// `DISPLAY_BUFFER_OLED` slot of `display_buffer_dirty` - see that field's
 /// doc comment for why this can't share a single flag with `iled_task`.
 pub async fn oled_task(i2c: I2cDriver<'static>, global: Rc<RefCell<Global>>) {
@@ -44,8 +47,7 @@ pub async fn oled_task(i2c: I2cDriver<'static>, global: Rc<RefCell<Global>>) {
                     for col in 0 .. 128 {
                         let mut col_buf = 0u8;
                         for b in 0 .. 8 {
-                            col_buf >>= 1;
-                            col_buf |= g.display_buffer[(row * 128) + (b * 128 / 8) + (col / 8)] << (col % 8) & 0b10000000;
+                            col_buf |= (g.display_pixel(col, row * 8 + b) as u8) << b;
                         }
                         page[col] = col_buf;
                     }

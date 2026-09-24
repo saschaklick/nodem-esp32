@@ -76,7 +76,7 @@ fn main() -> anyhow::Result<()> {
     // via `unsafe` `steal()` calls - see its doc comment for why it needs to
     // own that rather than being handed an already-constructed driver from
     // here.
-    let global = Rc::new(RefCell::new(Global::new()));
+    let global = Rc::new(RefCell::new(Global::new(nodem::read_nodem_config(nvs.clone()))));
 
     let executor: LocalExecutor = Default::default();
 

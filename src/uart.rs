@@ -85,7 +85,10 @@ pub async fn uart_task(
                     g.reregister = true;
                 }
                 if let Some(device_name) = interrupt.take_device_name() {
-                    g.cloud_status.device_name = Some(device_name);
+                    g.cloud_status.device_name = device_name;
+                }
+                if let Some(nodem_config) = interrupt.take_nodem_config() {
+                    g.resize_display(nodem_config);
                 }
                 if let Some(iled_config) = interrupt.take_iled_config() {
                     g.iled_config = iled_config;

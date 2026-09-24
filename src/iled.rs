@@ -10,7 +10,7 @@ use esp_idf_svc::hal::i2s::config::{
 use esp_idf_svc::hal::i2s::{I2sDriver, I2sTx, I2S0};
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
 
-use crate::global::{Global, DISPLAY_BUFFER_ILED, NODEM_DISPLAY_HEIGHT, NODEM_DISPLAY_WIDTH};
+use crate::global::{Global, DISPLAY_BUFFER_ILED};
 
 // pub(crate): `command_listener::CommandListener` writes
 // `NVS_KEY_CONFIG` when "#iled" successfully parses - see
@@ -605,9 +605,8 @@ impl IledConfig {
     /// `width`/`height` failing to parse (though not being empty or "0" -
     /// see `parse_dimension`), an unrecognized `layout` character (see
     /// `parse_layout`), `protocol` (after any name lookup) not splitting
-    /// into exactly five parts, a `width`/`height`/`width * height` outside
-    /// what `sample_from_dom`/`FRAME_LEN` can actually handle (see
-    /// `NODEM_DISPLAY_WIDTH`/`HEIGHT` and `MAX_LEDS`), or a protocol
+    /// into exactly five parts, a `width * height` outside what `FRAME_LEN`
+    /// can actually handle (see `MAX_LEDS`), or a protocol
     /// part/color/off_color outside those fields' own parsers' bounds.
     pub(crate) fn parse(line: &str) -> Option<Self> {
         let mut fields = line.split(',').map(str::trim);
@@ -645,8 +644,7 @@ impl IledConfig {
         let on_color = parse_color(color, (16, 0, 0, 0, 0))?;
         let off_color = parse_color(off_color, (0, 0, 0, 0, 0))?;
 
-        if width > NODEM_DISPLAY_WIDTH as usize || height > NODEM_DISPLAY_HEIGHT as usize || width * height > MAX_LEDS
-        {
+        if width * height > MAX_LEDS {
             return None;
         }
 
@@ -816,25 +814,16 @@ impl Framebuffer {
 }
 
 /// Crops the top-left `config.width`x`config.height` corner of the shared
-/// `Global::display_buffer` - the nodem DOM/OLED framebuffer,
-/// `NODEM_DISPLAY_WIDTH`x`NODEM_DISPLAY_HEIGHT`, 1 bit/pixel, row-major,
-/// MSB-first within each byte (see `oled_task`'s own decoding of this same
-/// buffer, which this mirrors) - into the framebuffer, pixel for pixel: LED
+/// nodem DOM framebuffer (`Global::display_buffer`, read through
+/// `Global::display_pixel`) into the framebuffer, pixel for pixel: LED
 /// framebuffer pixel `(x, y)` is exactly DOM pixel `(x, y)`, no scaling or
 /// sampling. Both sides are already monochrome (on/off), so this is a direct
-/// copy of that one bit, no thresholding or color conversion needed. The
-/// "#iled" command (`crate::command_listener`) validates `width` and
-/// `height` against `NODEM_DISPLAY_WIDTH`/`NODEM_DISPLAY_HEIGHT` for exactly
-/// this reason - a config that didn't fit would panic here on an
-/// out-of-bounds `display_buffer` index.
-fn sample_from_dom(fb: &mut Framebuffer, config: &IledConfig, display_buffer: &[u8]) {
-    let dom_stride = NODEM_DISPLAY_WIDTH as usize / 8;
-
+/// copy of that one bit, no thresholding or color conversion needed. An LED
+/// beyond the DOM's own `NodemConfig` size just stays off.
+fn sample_from_dom(fb: &mut Framebuffer, config: &IledConfig, g: &Global) {
     for y in 0..config.height {
         for x in 0..config.width {
-            let byte = display_buffer[y * dom_stride + x / 8];
-            let on = (byte >> (7 - x % 8)) & 1 != 0;
-            fb.set(x, y, on);
+            fb.set(x, y, g.display_pixel(x, y));
         }
     }
 }
@@ -1122,7 +1111,7 @@ pub async fn iled_task(global: Rc<RefCell<Global>>, nvs: EspDefaultNvsPartition)
 
         {
             let g = global.borrow();
-            sample_from_dom(&mut fb, &config, &g.display_buffer[..]);
+            sample_from_dom(&mut fb, &config, &g);
         }
 
         fb.render(&mut frame);

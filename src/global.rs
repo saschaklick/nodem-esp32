@@ -4,12 +4,7 @@ use esp_idf_svc::ws::client::EspWebSocketClient;
 use nodem_rs::runtime::DOM;
 
 use crate::iled::IledConfig;
-
-// pub(crate): `iled_task` downsamples `Global::display_buffer` into its own
-// framebuffer using these same dimensions - see its doc comment.
-pub(crate) const NODEM_DISPLAY_WIDTH: u32 = 128;
-pub(crate) const NODEM_DISPLAY_HEIGHT: u32 = 64;
-const NODEM_BUFFER_LEN: usize = (NODEM_DISPLAY_WIDTH * NODEM_DISPLAY_HEIGHT / 8) as usize;
+use crate::nodem::NodemConfig;
 
 const COMMAND_BUF_LEN: usize = 1024;
 
@@ -230,7 +225,11 @@ pub struct Global {
     // even as `Global` itself gets moved around (e.g. into the `Rc<RefCell<_>>`
     // in `main`). A plain `[u8; N]` field would move (and thus dangle the
     // pointer) right along with it.
-    pub display_buffer: Box<[u8; NODEM_BUFFER_LEN]>,
+    // Sized from `nodem_config` - see `NodemConfig::buffer_len`.
+    pub display_buffer: Box<[u8]>,
+    // Shape of `display_buffer` - read from NVS in `main`, changed at
+    // runtime only through `resize_display`. See `display_pixel`.
+    pub nodem_config: NodemConfig,
     // Set (every element at once) by `nodem_task` whenever it re-renders
     // into `display_buffer`; index `DISPLAY_BUFFER_OLED`/`DISPLAY_BUFFER_ILED`
     // cleared independently by `oled_task`/`iled_task` respectively, each
@@ -269,12 +268,12 @@ pub struct Global {
 }
 
 impl Global {
-    pub fn new() -> Self {
-        let mut display_buffer = Box::new([0u8; NODEM_BUFFER_LEN]);
+    pub fn new(nodem_config: NodemConfig) -> Self {
+        let mut display_buffer = vec![0u8; nodem_config.buffer_len()].into_boxed_slice();
         let runtime = DOM::new(
             &mut display_buffer[..],
-            NODEM_DISPLAY_WIDTH as _,
-            NODEM_DISPLAY_HEIGHT as _,
+            nodem_config.width,
+            nodem_config.height,
         );
 
         Self {
@@ -283,6 +282,7 @@ impl Global {
             cloud_status: CloudStatus::new(),
             oled_status: OledStatus::new(),
             display_buffer,
+            nodem_config,
             display_buffer_dirty: [false; DISPLAY_BUFFER_CONSUMERS],
             runtime,
             command_buf: [0u8; COMMAND_BUF_LEN],
@@ -293,5 +293,34 @@ impl Global {
             pkg_reload: false,
             ws_client: None,
         }
+    }
+
+    /// Swaps in a fresh, blank `display_buffer` of `nodem_config`'s size and
+    /// points the DOM's `Surface` at it - it redraws everything every frame,
+    /// so the next `run()` renders the current page at the new size. The new
+    /// buffer is pointed to before the old one is dropped, so `Surface` never
+    /// holds a dangling pointer.
+    pub fn resize_display(&mut self, nodem_config: NodemConfig) {
+        if nodem_config == self.nodem_config {
+            return;
+        }
+        let mut display_buffer = vec![0u8; nodem_config.buffer_len()].into_boxed_slice();
+        self.runtime.surface.resize(&mut display_buffer[..], nodem_config.width, nodem_config.height);
+        self.display_buffer = display_buffer;
+        self.nodem_config = nodem_config;
+        self.display_buffer_dirty = [true; DISPLAY_BUFFER_CONSUMERS];
+        log::info!("framebuffer resized to {}", nodem_config.to_nvs_string());
+    }
+
+    /// Whether pixel `(x, y)` of `display_buffer` is set - 1 bit/pixel,
+    /// packed row-major and MSB-first exactly as `nodem_rs::Surface` draws
+    /// it. Anything outside `nodem_config`'s `width`x`height` reads as off,
+    /// so a display bigger than the framebuffer just shows blank beyond it.
+    pub fn display_pixel(&self, x: usize, y: usize) -> bool {
+        if x >= self.nodem_config.width as usize || y >= self.nodem_config.height as usize {
+            return false;
+        }
+        let i = y * self.nodem_config.width as usize + x;
+        (self.display_buffer[i / 8] >> (7 - i % 8)) & 1 != 0
     }
 }

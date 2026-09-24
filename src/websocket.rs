@@ -272,7 +272,10 @@ fn handle_incoming_message(
                 g.reregister = true;
             }
             if let Some(device_name) = command_listener.take_device_name() {
-                g.cloud_status.device_name = Some(device_name);
+                g.cloud_status.device_name = device_name;
+            }
+            if let Some(nodem_config) = command_listener.take_nodem_config() {
+                g.resize_display(nodem_config);
             }
             if let Some(iled_config) = command_listener.take_iled_config() {
                 g.iled_config = iled_config;
