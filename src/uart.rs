@@ -93,6 +93,9 @@ pub async fn uart_task(
                 if let Some(oled_config) = interrupt.take_oled_config() {
                     g.oled_config = oled_config;
                 }
+                if let Some(ping_interval) = interrupt.take_ping_interval() {
+                    g.ping_interval_secs = ping_interval;
+                }
                 if let Some(iled_config) = interrupt.take_iled_config() {
                     g.iled_config = iled_config;
                 }

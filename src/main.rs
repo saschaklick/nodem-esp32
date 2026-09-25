@@ -5,6 +5,7 @@ use edge_executor::{block_on, LocalExecutor};
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::i2c::{I2cConfig, I2cDriver};
 use esp_idf_svc::hal::peripherals::Peripherals;
+use esp_idf_svc::hal::temp_sensor::{TempSensorConfig, TempSensorDriver};
 use esp_idf_svc::hal::uart::{config::Config as UartConfig, AsyncUartDriver};
 use esp_idf_svc::hal::units::FromValueType;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
@@ -78,6 +79,15 @@ fn main() -> anyhow::Result<()> {
     // own that rather than being handed an already-constructed driver from
     // here.
     let global = Rc::new(RefCell::new(Global::new(nodem::read_nodem_config(nvs.clone()))));
+
+    // Only read on demand, by "#stat" - a failure here just leaves the
+    // temperature out of it.
+    let temp_sensor = TempSensorDriver::new(&TempSensorConfig::default(), peripherals.temp_sensor)
+        .and_then(|mut sensor| sensor.enable().map(|()| sensor));
+    match temp_sensor {
+        Ok(sensor) => global.borrow_mut().temp_sensor = Some(sensor),
+        Err(e) => log::error!("Temperature sensor setup failed: {e:?}"),
+    }
 
     let executor: LocalExecutor = Default::default();
 

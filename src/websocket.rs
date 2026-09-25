@@ -42,6 +42,13 @@ const ROOT_CA_CERT: &[u8] = concat!(
 // and `NVS_KEY_DEVICE_NAME` when it gets provisioned over UART - see
 // `crate::command_listener::CommandListener`.
 pub(crate) const NVS_NAMESPACE: &str = "device";
+
+// pub(crate): written by "#ping"/"#factory" (`command_listener`). How often, in whole seconds, `websocket_task` sends its
+// application-level "ping" while connected - see the heartbeat comment
+// there. The live value is `Global::ping_interval_secs`.
+pub(crate) const NVS_KEY_PING_INTERVAL: &str = "ping";
+pub(crate) const DEFAULT_PING_INTERVAL_SECS: u64 = 10;
+pub(crate) const PING_INTERVAL_RANGE: core::ops::RangeInclusive<u64> = 1..=3600;
 pub(crate) const NVS_KEY_REGISTRATION_CODE: &str = "reg_code";
 pub(crate) const NVS_KEY_DEVICE_NAME: &str = "device_name";
 // pub(crate): bounds `uart_task`'s "#reg" command enforces when
@@ -61,7 +68,7 @@ pub(crate) const NVS_KEY_CLOUD_HOST: &str = "cloud_host";
 /// attempt is rejected - too short to ever collide with a real code (`uart`'s
 /// "#reg" command only accepts a 6-character code as its first argument).
 /// Marks the code as spent (so it isn't retried forever) while leaving a
-/// visible trace, via "#cfg"/"#nvs", that the last attempt failed.
+/// visible trace, via "#nvs", that the last attempt failed.
 const NVS_VALUE_REGISTRATION_REJECTED: &str = "0";
 
 /// Manages device registration and the websocket client connection.
@@ -84,6 +91,9 @@ const NVS_VALUE_REGISTRATION_REJECTED: &str = "0";
 /// it wipes the stored device id/secret, closes the client, and starts the
 /// whole registration dance over.
 pub async fn websocket_task(global: Rc<RefCell<Global>>, nvs: EspDefaultNvsPartition) {
+    // Before waiting on Wi-Fi, so "#stat" reports the stored value from boot on.
+    global.borrow_mut().ping_interval_secs = read_ping_interval(nvs.clone());
+
     wait_for_wifi(&global).await;
 
     // Same admin command listener `uart_task` uses, so any "#..." command
@@ -208,7 +218,7 @@ pub async fn websocket_task(global: Rc<RefCell<Global>>, nvs: EspDefaultNvsParti
                 break;
             };
 
-            if connected && last_ping.elapsed() >= embassy_time::Duration::from_secs(10) {
+            if connected && last_ping.elapsed() >= embassy_time::Duration::from_secs(global.borrow().ping_interval_secs) {
                 last_ping = Instant::now();
 
                 let ping = format!("ping,{}", Instant::now().as_secs());
@@ -279,6 +289,9 @@ fn handle_incoming_message(
             }
             if let Some(oled_config) = command_listener.take_oled_config() {
                 g.oled_config = oled_config;
+            }
+            if let Some(ping_interval) = command_listener.take_ping_interval() {
+                g.ping_interval_secs = ping_interval;
             }
             if let Some(iled_config) = command_listener.take_iled_config() {
                 g.iled_config = iled_config;
@@ -367,6 +380,42 @@ fn forward_incoming_message(event: &Result<WebSocketEvent, EspIOError>, tx: &mps
 /// The host (and, if applicable, port) for every cloud connection - both the
 /// websocket and the HTTP registration handshake. `NVS_KEY_CLOUD_HOST` when
 /// set (via the "#host" UART command), else `DEFAULT_CLOUD_HOST`.
+/// Reads `NVS_KEY_PING_INTERVAL`, the same way `nodem::read_nodem_config`
+/// does its own key: a missing value (first boot) or one that isn't a whole
+/// number of seconds within `PING_INTERVAL_RANGE` is replaced in NVS by
+/// `DEFAULT_PING_INTERVAL_SECS`, so "#nvs" shows what's actually in use.
+fn read_ping_interval(nvs: EspDefaultNvsPartition) -> u64 {
+    let nvs = match EspNvs::new(nvs, NVS_NAMESPACE, true) {
+        Ok(nvs) => nvs,
+        Err(e) => {
+            log::error!("Failed to open '{NVS_NAMESPACE}' NVS namespace: {e:?}");
+            return DEFAULT_PING_INTERVAL_SECS;
+        }
+    };
+
+    let mut buf = [0u8; 16];
+    let raw = nvs.get_str(NVS_KEY_PING_INTERVAL, &mut buf).ok().flatten();
+
+    if let Some(secs) = raw.and_then(parse_ping_interval) {
+        return secs;
+    }
+
+    if let Some(raw) = raw {
+        log::warn!("Malformed '{NVS_KEY_PING_INTERVAL}' in NVS ('{raw}'), falling back to default");
+    }
+
+    if let Err(e) = nvs.set_str(NVS_KEY_PING_INTERVAL, &DEFAULT_PING_INTERVAL_SECS.to_string()) {
+        log::error!("Failed to persist default '{NVS_KEY_PING_INTERVAL}' to NVS: {e:?}");
+    }
+
+    DEFAULT_PING_INTERVAL_SECS
+}
+
+/// `None` unless `s` is a whole number of seconds within `PING_INTERVAL_RANGE`.
+pub(crate) fn parse_ping_interval(s: &str) -> Option<u64> {
+    s.trim().parse().ok().filter(|secs| PING_INTERVAL_RANGE.contains(secs))
+}
+
 fn read_cloud_host(nvs: &EspNvs<NvsDefault>) -> String {
     let mut host_buf = [0u8; 128];
 

@@ -1,5 +1,6 @@
 use std::net::Ipv4Addr;
 
+use esp_idf_svc::hal::temp_sensor::TempSensorDriver;
 use esp_idf_svc::ws::client::EspWebSocketClient;
 use nodem_rs::runtime::DOM;
 
@@ -274,6 +275,15 @@ pub struct Global {
     // that task, so `websocket::close_websocket` can close it cleanly from
     // wherever Wi-Fi is about to go down.
     pub ws_client: Option<EspWebSocketClient<'static>>,
+    // The chip's internal temperature sensor, installed and enabled once in
+    // `main` - read by "#stat" (via `CommandListener::update_status`).
+    // `None` if setting it up failed.
+    pub temp_sensor: Option<TempSensorDriver<'static>>,
+    // Seconds between `websocket_task`'s pings - loaded from
+    // `websocket::NVS_KEY_PING_INTERVAL` at startup, then written by
+    // `uart_task`/`websocket_task` right after a "#ping"/"#factory", same
+    // pattern as `iled_config`. Read fresh by the ping loop every lap.
+    pub ping_interval_secs: u64,
 }
 
 impl Global {
@@ -302,6 +312,8 @@ impl Global {
             oled_config: None,
             pkg_reload: false,
             ws_client: None,
+            temp_sensor: None,
+            ping_interval_secs: crate::websocket::DEFAULT_PING_INTERVAL_SECS,
         }
     }
 

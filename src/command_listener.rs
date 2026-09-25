@@ -60,6 +60,9 @@ pub(crate) struct CommandListener {
     // `Global::oled_config` right away - same double `Option` as
     // `iled_config`, the inner `None` meaning the display is disabled.
     oled_config: Option<Option<OledConfig>>,
+    // Set by "#ping"/"#factory" so callers can mirror it into
+    // `Global::ping_interval_secs` right away, same pattern as `nodem_config`.
+    ping_interval: Option<u64>,
     // Snapshot of `Global::wifi_status`/`cloud_status`/`oled_status` and the
     // live iLED/OLED configs, refreshed by `update_status` right before each
     // `process_command` call (same reason this doesn't hold `Global` itself -
@@ -70,6 +73,9 @@ pub(crate) struct CommandListener {
     oled_status: OledStatus,
     live_oled_config: Option<OledConfig>,
     live_iled_config: Option<IledConfig>,
+    free_heap: u32,
+    live_ping_interval: u64,
+    core_temp: Option<f32>,
     // Backing store for "pkg" uploads (see `pkg_start` below).
     pkg_partition: Option<EspPartition>,
     // Absolute offset in the "pkg" partition of the next byte to be written.
@@ -108,11 +114,15 @@ impl CommandListener {
             iled_config: None,
             nodem_config: None,
             oled_config: None,
+            ping_interval: None,
             wifi_status: WifiStatus::new(),
             cloud_status: CloudStatus::new(),
             oled_status: OledStatus::new(),
             live_oled_config: None,
             live_iled_config: None,
+            free_heap: 0,
+            live_ping_interval: websocket::DEFAULT_PING_INTERVAL_SECS,
+            core_temp: None,
             pkg_partition: None,
             pkg_written: 0,
             pkg_updated: false,
@@ -152,6 +162,10 @@ impl CommandListener {
         core::mem::take(&mut self.oled_config)
     }
 
+    pub(crate) fn take_ping_interval(&mut self) -> Option<u64> {
+        core::mem::take(&mut self.ping_interval)
+    }
+
     pub(crate) fn take_pkg_updated(&mut self) -> bool {
         core::mem::take(&mut self.pkg_updated)
     }
@@ -162,6 +176,9 @@ impl CommandListener {
         self.oled_status = g.oled_status.clone();
         self.live_oled_config = g.oled_config;
         self.live_iled_config = g.iled_config;
+        self.live_ping_interval = g.ping_interval_secs;
+        self.free_heap = unsafe { sys::esp_get_free_heap_size() };
+        self.core_temp = g.temp_sensor.as_ref().and_then(|sensor| sensor.get_celsius().ok());
     }
 
     fn store(&self, namespace: &str, key: &str, value: &str, min_len: usize, max_len: usize, ret: &mut Ret) {
@@ -189,21 +206,6 @@ impl CommandListener {
         }
     }
 
-    fn write_masked(&self, res: &mut dyn core::fmt::Write, namespace: &str, key: &str) -> core::fmt::Result {
-        let mut buf = [0u8; 64];
-        let len = EspNvs::new(self.nvs.clone(), namespace, false) .ok() .and_then(|nvs| nvs.get_str(key, &mut buf).ok().flatten()).map_or(0, str::len);
-        write!(res, "{key}=")?;
-        for _ in 0..len {
-            res.write_char('*')?;
-        }
-        res.write_str("\r\n")
-    }
-
-    /// Every entry in the default NVS partition, across all namespaces
-    /// (ESP-IDF's own, e.g. "nvs.net80211", included), unmasked, one
-    /// "<namespace>/<key>=<value>" line each - blobs as their length only.
-    /// The iterator is drained into a list first, since reading the values
-    /// means opening each namespace, and released before that.
     fn write_all_entries(&self, res: &mut dyn core::fmt::Write) -> core::fmt::Result {
         let mut entries = Vec::new();
         let mut it: sys::nvs_iterator_t = core::ptr::null_mut();
@@ -286,6 +288,8 @@ impl IControl for CommandListener {
                     self.store(oled::NVS_NAMESPACE, oled::NVS_KEY_CONFIG, &OledConfig::default().to_nvs_string(), 1, oled::NVS_VALUE_MAX_LEN, &mut ret);
                     self.nodem_config = Some(NodemConfig::default());
                     self.oled_config = Some(Some(OledConfig::default()));
+                    self.store(websocket::NVS_NAMESPACE, websocket::NVS_KEY_PING_INTERVAL, &websocket::DEFAULT_PING_INTERVAL_SECS.to_string(), 1, 16, &mut ret);
+                    self.ping_interval = Some(websocket::DEFAULT_PING_INTERVAL_SECS);
                     self.erase_pkg_header();
                     self.iled_config = Some(Some(IledConfig::default()));
                     self.device_name = Some(None);
@@ -397,6 +401,21 @@ impl IControl for CommandListener {
                         Err(()) => ret = Ret::MalformedValue,
                     }
                 }
+                // "#ping,<seconds>" - how often the websocket pings the cloud
+                // while connected, a whole number within
+                // `websocket::PING_INTERVAL_RANGE`. A bare "#ping" resets it
+                // to `DEFAULT_PING_INTERVAL_SECS`. Applied right away
+                // (`Global::ping_interval_secs`).
+                "ping" => {
+                    let secs = if arg_0.is_empty() { Some(websocket::DEFAULT_PING_INTERVAL_SECS) } else { websocket::parse_ping_interval(arg_0) };
+                    match secs {
+                        Some(secs) => {
+                            self.store(websocket::NVS_NAMESPACE, websocket::NVS_KEY_PING_INTERVAL, &secs.to_string(), 1, 16, &mut ret);
+                            if ret == Ret::Ok { self.ping_interval = Some(secs); }
+                        }
+                        None => ret = Ret::MalformedValue,
+                    }
+                }
                 // No value ("#host" with nothing after it, or an empty field)
                 // clears back to `websocket::DEFAULT_CLOUD_HOST` rather than
                 // erroring. A device's registration (`NVS_KEY_DEVICE_ID`/
@@ -423,17 +442,12 @@ impl IControl for CommandListener {
                     self.reregister = true;
                 }
                 "cfg" => {
-                    let _ = self.write_plain(res, wifi::NVS_NAMESPACE, wifi::NVS_KEY_SSID);
-                    let _ = self.write_masked(res, wifi::NVS_NAMESPACE, wifi::NVS_KEY_PASS);
-                    let _ = self.write_plain(res, websocket::NVS_NAMESPACE, websocket::NVS_KEY_DEVICE_NAME);
-                    let _ = self.write_masked(res, websocket::NVS_NAMESPACE, websocket::NVS_KEY_REGISTRATION_CODE);
-                    let _ = self.write_plain(res, websocket::NVS_NAMESPACE, websocket::NVS_KEY_CLOUD_HOST);
                     let _ = self.write_plain(res, iled::NVS_NAMESPACE, iled::NVS_KEY_CONFIG);
-                    let _ = self.write_plain(res, nodem::NVS_NAMESPACE, nodem::NVS_KEY_LAST_PAGE);
-                    let _ = self.write_plain(res, nodem::NVS_NAMESPACE, nodem::NVS_KEY_CONFIG);
                     let _ = self.write_plain(res, oled::NVS_NAMESPACE, oled::NVS_KEY_CONFIG);
+                    let _ = self.write_plain(res, nodem::NVS_NAMESPACE, nodem::NVS_KEY_CONFIG);
+                    let _ = self.write_plain(res, websocket::NVS_NAMESPACE, websocket::NVS_KEY_DEVICE_NAME);
                 }
-                // Four CSV lines: wifi, cloud, oled and iled - the last field
+                // Five CSV lines: wifi, cloud, oled, iled and dev - the last field
                 // of each of the first three (an error message) is left
                 // unescaped and thus may itself contain commas, so a parser
                 // should treat it as "everything from here to end of line"
@@ -441,8 +455,18 @@ impl IControl for CommandListener {
                 // "iled,<on>,<w>x<h>": <on> is 1/0 (configured or disabled),
                 // the resolution empty while off; <i2c> is "ok" or the
                 // `OledConnectionStatus` in words ("initializing", or the
-                // failure's error).
+                // failure's error). "dev,<ping_interval_s>,<free_heap_bytes>,
+                // <core_temp_celsius>" - the temperature to one decimal, empty
+                // if the sensor isn't available.
                 "stat" => {
+                    let _ = write!(
+                        res,
+                        "dev,{},{},{}\r\n",
+                        self.live_ping_interval,
+                        self.free_heap,
+                        self.core_temp.map(|t| format!("{t:.1}")).unwrap_or_default(),
+                    );
+                    
                     let w = &self.wifi_status;
                     let (wifi_state, wifi_error) = match &w.status {
                         WifiConnectionStatus::WaitingForConfiguration => ("waiting", ""),
@@ -495,7 +519,7 @@ impl IControl for CommandListener {
                     let _ = match self.live_iled_config {
                         Some(i) => write!(res, "iled,1,{}x{}\r\n", i.width, i.height),
                         None => write!(res, "iled,0,\r\n"),
-                    };
+                    };                    
                 }
                 "nvs" => {
                     let _ = self.write_all_entries(res);

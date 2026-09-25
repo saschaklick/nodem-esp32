@@ -40,8 +40,7 @@ esp-idf-svc = { version = "0.52.1", features = ["critical-section", "embassy-tim
 embassy-time = { version = "0.5", features = ["generic-queue-8"] }
 edge-executor = "0.5"
 ssd1306 = { version = "0.10", default-features = false }
-#nodem-rs = { git = "https://github.com/saschaklick/nodem-rs", features = ["std", "base", "alloc", "runtime"] }
-nodem-rs = { path = "../nodem-rs", features = ["std", "base", "alloc", "runtime"] }
+nodem-rs = { git = "https://github.com/saschaklick/nodem-rs", features = ["std", "base", "alloc", "runtime"] }
 virtmach = { git = "https://github.com/saschaklick/virtmach-rs", features = ["i16", "random"] }
 
 [build-dependencies]
