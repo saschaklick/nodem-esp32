@@ -714,15 +714,37 @@ const MAX_BIT_RATE_HZ: u64 = MAX_RESOLUTION as u64 * 1_000_000_000 / MIN_PATTERN
 /// not the current config's actual reset) is what sizes `FRAME_LEN`.
 const MAX_RESET_BYTES: usize = (MAX_BIT_RATE_HZ * MAX_RESET_NS as u64 / 1_000_000_000 / 8) as usize;
 
-// pub(crate): `build_i2s` needs this to size the I2S channel's DMA buffer -
-// see its comment on `frames_per_buffer`. Sized for `MAX_LEDS` LEDs at
-// `TimingConfig`/`ColorPattern`'s worst-case bit rate/reset/packet size, not
-// the currently-configured `IledConfig`'s actual values - see `MAX_LEDS`'s
-// doc comment for why. Whatever's beyond the actually-rendered LEDs and
-// their actually-needed reset for a smaller/slower/narrower config just
-// stays zero, extending the reset/off tail well past what's needed -
-// harmless, WS2812 doesn't mind a longer-than-needed low period.
-pub(crate) const FRAME_LEN: usize = MAX_LED_DATA_BYTES + MAX_RESET_BYTES;
+/// Bytes one frame needs at least: `MAX_LEDS` LEDs at `TimingConfig`/
+/// `ColorPattern`'s worst-case bit rate/reset/packet size, not the
+/// currently-configured `IledConfig`'s actual values - see `MAX_LEDS`'s doc
+/// comment for why.
+const MIN_FRAME_LEN: usize = MAX_LED_DATA_BYTES + MAX_RESET_BYTES;
+
+/// ESP-IDF's cap on a single I2S DMA buffer (`I2S_DMA_BUFFER_MAX_SIZE`, 4092
+/// on ESP32-C3) - asking for more gets silently clamped to this ("dma frame
+/// num is out of dma buffer size"), which would leave frames no longer
+/// lining up with buffer boundaries (see `iled_task`'s doc comment).
+const I2S_DMA_BUFFER_MAX: usize = 4092;
+
+/// A frame is split evenly across this many DMA buffers, each
+/// `DMA_BUFFER_LEN` bytes (kept a multiple of 4, as DMA descriptors want) -
+/// so every `write_all_async` of a whole frame still starts and ends exactly
+/// on a buffer boundary.
+const DMA_BUFFERS_PER_FRAME: usize = MIN_FRAME_LEN.div_ceil(I2S_DMA_BUFFER_MAX);
+const DMA_BUFFER_LEN: usize = MIN_FRAME_LEN.div_ceil(DMA_BUFFERS_PER_FRAME).next_multiple_of(4);
+const _: () = assert!(DMA_BUFFER_LEN <= I2S_DMA_BUFFER_MAX);
+/// DMA ring size (ESP-IDF's usual default) - it needs room for at least one
+/// whole frame.
+const DMA_BUFFER_COUNT: usize = 6;
+const _: () = assert!(DMA_BUFFERS_PER_FRAME <= DMA_BUFFER_COUNT);
+
+// pub(crate): what `Framebuffer::render` fills and `iled_task` writes in
+// one go - `MIN_FRAME_LEN` rounded up to whole DMA buffers. Whatever's
+// beyond the actually-rendered LEDs and their actually-needed reset for a
+// smaller/slower/narrower config (or this rounding) just stays zero,
+// extending the reset/off tail past what's needed - harmless, WS2812
+// doesn't mind a longer-than-needed low period.
+pub(crate) const FRAME_LEN: usize = DMA_BUFFER_LEN * DMA_BUFFERS_PER_FRAME;
 
 /// Encodes one LED's color into `buf` (exactly `bytes_per_led` - see
 /// `Framebuffer::render` - long, and assumed already zeroed) per
@@ -878,7 +900,7 @@ const WS_PIN: u8 = 3;
 /// (Re)builds the I2S TX driver for the LED chain at a given sample rate,
 /// tx-enabled and ready to write to. Every part of the driver config other
 /// than the sample rate is fixed - see `iled_task`'s doc comment for the
-/// reasoning behind `auto_clear`, `frames_per_buffer(FRAME_LEN)`, Mono +
+/// reasoning behind `auto_clear`, `frames_per_buffer(DMA_BUFFER_LEN)`, Mono +
 /// `msb_slot_default`, and why the sample rate has to be
 /// `timing.sample_rate_hz()` rather than something simpler.
 ///
@@ -896,7 +918,10 @@ const WS_PIN: u8 = 3;
 /// this".
 fn build_i2s(sample_rate_hz: u32) -> anyhow::Result<I2sDriver<'static, I2sTx>> {
     let config = StdConfig::new(
-        I2sChannelConfig::default().auto_clear(true).frames_per_buffer(FRAME_LEN as u32),
+        I2sChannelConfig::default()
+            .auto_clear(true)
+            .dma_buffer_count(DMA_BUFFER_COUNT as u32)
+            .frames_per_buffer(DMA_BUFFER_LEN as u32),
         StdClkConfig::from_sample_rate_hz(sample_rate_hz),
         StdSlotConfig::msb_slot_default(DataBitWidth::Bits8, SlotMode::Mono),
         StdGpioConfig::default(),
@@ -956,7 +981,7 @@ fn log_timing_report(timing: &TimingConfig) {
     let mclk_div = I2S_SOURCE_CLOCK_HZ as f64 / mclk_hz as f64;
 
     log::info!(
-        "iLED timing: pattern \"1\"={} \"0\"={} (resolution {}), {}ns/pattern, {}ns reset -> bit rate {}Hz, I2S sample rate {}Hz -> BCLK {}Hz, MCLK {}Hz (= {}MHz source / {mclk_div:.4}); DMA buffer {FRAME_LEN} bytes/write",
+        "iLED timing: pattern \"1\"={} \"0\"={} (resolution {}), {}ns/pattern, {}ns reset -> bit rate {}Hz, I2S sample rate {}Hz -> BCLK {}Hz, MCLK {}Hz (= {}MHz source / {mclk_div:.4}); {FRAME_LEN} bytes/write in {DMA_BUFFERS_PER_FRAME} DMA buffers of {DMA_BUFFER_LEN}",
         render(timing.pattern_high),
         render(timing.pattern_low),
         timing.resolution,
@@ -993,12 +1018,13 @@ fn log_timing_report(timing: &TimingConfig) {
 /// continuous - it doesn't idle between `write_all_async` calls, it keeps
 /// shifting out whatever's in its DMA buffers; without this, any bytes in a
 /// buffer not just overwritten keep whatever an *earlier* write left there
-/// instead of reading as reset/idle. `frames_per_buffer(FRAME_LEN)`: sizing
-/// each DMA buffer to exactly one frame makes every `write_all_async` call
-/// start and end precisely on a buffer boundary, so no frame's data can ever
-/// straddle one and corrupt (or skip) a LED's update - both of these were
-/// real, previously-diagnosed bugs on real hardware, not just theoretical
-/// concerns. BCLK and WS are real pins that mode requires wiring up in the
+/// instead of reading as reset/idle. `frames_per_buffer(DMA_BUFFER_LEN)`:
+/// every frame is exactly `DMA_BUFFERS_PER_FRAME` whole DMA buffers (one
+/// buffer can't hold a worst-case frame - see `I2S_DMA_BUFFER_MAX`), which
+/// makes every `write_all_async` call start and end precisely on a buffer
+/// boundary, so no frame's data can ever straddle one and corrupt (or skip)
+/// a LED's update - both of these were real, previously-diagnosed bugs on
+/// real hardware, not just theoretical concerns. BCLK and WS are real pins that mode requires wiring up in the
 /// driver config, but carry nothing this protocol cares about - only DOUT
 /// (GPIO2, wired to the chain's `Din`) matters electrically.
 ///
