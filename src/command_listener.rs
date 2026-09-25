@@ -63,6 +63,9 @@ pub(crate) struct CommandListener {
     // Set by "#ping"/"#factory" so callers can mirror it into
     // `Global::ping_interval_secs` right away, same pattern as `nodem_config`.
     ping_interval: Option<u64>,
+    // Set by "#stat" so callers reset `Global::stat_events` right away,
+    // same pattern as `wifi_reconnect`.
+    stat_reported: bool,
     // Snapshot of `Global::wifi_status`/`cloud_status`/`oled_status` and the
     // live iLED/OLED configs, refreshed by `update_status` right before each
     // `process_command` call (same reason this doesn't hold `Global` itself -
@@ -75,6 +78,9 @@ pub(crate) struct CommandListener {
     live_iled_config: Option<IledConfig>,
     free_heap: u32,
     live_ping_interval: u64,
+    pkg_size: usize,
+    pkg_partition_size: usize,
+    pkg_meta: String,
     core_temp: Option<f32>,
     // Backing store for "pkg" uploads (see `pkg_start` below).
     pkg_partition: Option<EspPartition>,
@@ -115,6 +121,7 @@ impl CommandListener {
             nodem_config: None,
             oled_config: None,
             ping_interval: None,
+            stat_reported: false,
             wifi_status: WifiStatus::new(),
             cloud_status: CloudStatus::new(),
             oled_status: OledStatus::new(),
@@ -122,6 +129,9 @@ impl CommandListener {
             live_iled_config: None,
             free_heap: 0,
             live_ping_interval: websocket::DEFAULT_PING_INTERVAL_SECS,
+            pkg_size: 0,
+            pkg_partition_size: 0,
+            pkg_meta: String::new(),
             core_temp: None,
             pkg_partition: None,
             pkg_written: 0,
@@ -166,6 +176,10 @@ impl CommandListener {
         core::mem::take(&mut self.ping_interval)
     }
 
+    pub(crate) fn take_stat_reported(&mut self) -> bool {
+        core::mem::take(&mut self.stat_reported)
+    }
+
     pub(crate) fn take_pkg_updated(&mut self) -> bool {
         core::mem::take(&mut self.pkg_updated)
     }
@@ -177,6 +191,17 @@ impl CommandListener {
         self.live_oled_config = g.oled_config;
         self.live_iled_config = g.iled_config;
         self.live_ping_interval = g.ping_interval_secs;
+        self.pkg_size = g.pkg_size;
+        self.pkg_partition_size = g.pkg_partition_size;
+        // Only while a pkg is actually loaded: `Media::unload_pkg` doesn't
+        // clear `meta`, which after "#factory" would still point into the
+        // erased flash. Line breaks would split the "#stat" line, so they
+        // become spaces.
+        self.pkg_meta = if g.pkg_size > 0 {
+            g.runtime.surface.media.get_meta().replace(['\r', '\n'], " ")
+        } else {
+            String::new()
+        };
         self.free_heap = unsafe { sys::esp_get_free_heap_size() };
         self.core_temp = g.temp_sensor.as_ref().and_then(|sensor| sensor.get_celsius().ok());
     }
@@ -429,7 +454,7 @@ impl IControl for CommandListener {
                 // `ensure_device_credentials` finds no credentials *and* no
                 // code and reports `RegisterError::MissingCode`, which
                 // `websocket_task`'s retry loop turns into
-                // `RegistrationStatus::WaitingForCode` on its own - no need
+                // `RegistrationStatus::NoCode` on its own - no need
                 // to set that status here directly.
                 "host" => {
                     if !arg_0.is_empty() {
@@ -447,7 +472,7 @@ impl IControl for CommandListener {
                     let _ = self.write_plain(res, nodem::NVS_NAMESPACE, nodem::NVS_KEY_CONFIG);
                     let _ = self.write_plain(res, websocket::NVS_NAMESPACE, websocket::NVS_KEY_DEVICE_NAME);
                 }
-                // Five CSV lines: wifi, cloud, oled, iled and dev - the last field
+                // Six CSV lines: wifi, cloud, oled, iled, dev and pkg - the last field
                 // of each of the first three (an error message) is left
                 // unescaped and thus may itself contain commas, so a parser
                 // should treat it as "everything from here to end of line"
@@ -457,7 +482,13 @@ impl IControl for CommandListener {
                 // `OledConnectionStatus` in words ("initializing", or the
                 // failure's error). "dev,<ping_interval_s>,<free_heap_bytes>,
                 // <core_temp_celsius>" - the temperature to one decimal, empty
-                // if the sensor isn't available.
+                // if the sensor isn't available. "pkg,<size>,<available>,<meta>"
+                // - the loaded pkg's size in bytes (0 if none), the "pkg"
+                // partition's size, the most a future pkg can take (it
+                // replaces the current one), and the pkg's own meta text
+                // (`Media::get_meta`, empty without one) - last, since it may
+                // itself contain commas. Also resets
+                // `Global::stat_events` (via `stat_reported`).
                 "stat" => {
                     let _ = write!(
                         res,
@@ -466,6 +497,10 @@ impl IControl for CommandListener {
                         self.free_heap,
                         self.core_temp.map(|t| format!("{t:.1}")).unwrap_or_default(),
                     );
+
+                    let _ = write!(res, "pkg,{},{},{}\r\n", self.pkg_size, self.pkg_partition_size, self.pkg_meta);
+
+                    self.stat_reported = true;
                     
                     let w = &self.wifi_status;
                     let (wifi_state, wifi_error) = match &w.status {
@@ -486,10 +521,10 @@ impl IControl for CommandListener {
 
                     let c = &self.cloud_status;
                     let (reg_state, reg_error) = match &c.registration {
-                        RegistrationStatus::WaitingForCode => ("waiting", ""),
+                        RegistrationStatus::NoCode => ("no_reg", ""),
                         RegistrationStatus::Registering => ("registering", ""),
                         RegistrationStatus::Registered => ("registered", ""),
-                        RegistrationStatus::Failed(e) => ("failed", e.as_str()),
+                        RegistrationStatus::Failed(e) => ("reg_failed", e.as_str()),
                     };
                     let conn_state = match c.connection {
                         CloudConnectionStatus::Disconnected => "disconnected",

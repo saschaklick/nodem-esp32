@@ -102,6 +102,9 @@ pub async fn uart_task(
                 if interrupt.take_pkg_updated() {
                     g.pkg_reload = true;
                 }
+                if interrupt.take_stat_reported() {
+                    g.stat_events = 0;
+                }
 
                 match ret.1 {
                     Ok(()) => {

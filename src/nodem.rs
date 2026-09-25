@@ -217,6 +217,9 @@ pub async fn nodem_task(global: Rc<RefCell<Global>>, nvs: EspDefaultNvsPartition
             set_status_message(&mut g.runtime, message);
 
             g.runtime.run();
+            // Piggybacks on this always-running 60Hz loop - see
+            // `Global::track_stat_events`.
+            g.track_stat_events();
 
             g.display_buffer_dirty = [true; DISPLAY_BUFFER_CONSUMERS];
         }
@@ -259,17 +262,32 @@ fn set_status_message(runtime: &mut nodem_rs::runtime::DOM<'static>, message: Op
 /// for a region that's already mapped (without a handle of its own), so
 /// releasing the "old" one unmapped the new pkg too - an MMU fault on the
 /// next access.
+///
+/// Also records the outcome for "#stat"'s "pkg" line - `Global::pkg_size`
+/// (0 unless a pkg actually loaded), `Global::pkg_partition_size` - and
+/// bumps `Global::pkg_generation`, so every (re)load or unload counts as a
+/// `Global::stat_events` change.
 fn load_pkg_partition(g: &mut Global, mapping: &mut Option<*const u8>) -> bool {
-    let Ok(label) = std::ffi::CString::new(PKG_PARTITION_LABEL) else { return false; };
+    let loaded = load_pkg_partition_inner(g, mapping);
+    g.pkg_size = loaded.unwrap_or(0);
+    g.pkg_generation = g.pkg_generation.wrapping_add(1);
+    loaded.is_some()
+}
+
+/// The actual load - see `load_pkg_partition`. `Some(len)` once a pkg of
+/// `len` bytes has loaded.
+fn load_pkg_partition_inner(g: &mut Global, mapping: &mut Option<*const u8>) -> Option<usize> {
+    let Ok(label) = std::ffi::CString::new(PKG_PARTITION_LABEL) else { return None; };
     let partition = unsafe {
         sys::esp_partition_find_first(sys::esp_partition_type_t_ESP_PARTITION_TYPE_DATA, sys::esp_partition_subtype_t_ESP_PARTITION_SUBTYPE_ANY, label.as_ptr())
     };
-    let Some(partition_size) = (unsafe { partition.as_ref() }).map(|p| p.size as usize) else { return false; };
+    let Some(partition_size) = (unsafe { partition.as_ref() }).map(|p| p.size as usize) else { return None; };
+    g.pkg_partition_size = partition_size;
 
     let mut header = [0u8; 8];
     if let Err(e) = sys::esp!(unsafe { sys::esp_partition_read(partition, 0, header.as_mut_ptr() as *mut _, header.len()) }) {
         log::error!("'{PKG_PARTITION_LABEL}' partition read failed: {e:?}");
-        return false;
+        return None;
     }
     if &header[0..4] != b"PKG0" {
         // Also what a "#factory" (which erases the header) lands on: drop
@@ -278,12 +296,12 @@ fn load_pkg_partition(g: &mut Global, mapping: &mut Option<*const u8>) -> bool {
         log::info!("'{PKG_PARTITION_LABEL}' partition has no pkg, unloading");
         g.runtime.surface.media.unload_pkg();
         g.runtime.dom.clear();
-        return false;
+        return None;
     }
     let len = u32::from_ne_bytes(header[4..8].try_into().unwrap()) as usize;
     if len > partition_size {
         log::error!("'{PKG_PARTITION_LABEL}': pkg header claims {len} bytes, partition only {partition_size}");
-        return false;
+        return None;
     }
 
     let ptr = match *mapping {
@@ -294,7 +312,7 @@ fn load_pkg_partition(g: &mut Global, mapping: &mut Option<*const u8>) -> bool {
             let mut handle: esp_partition_mmap_handle_t = 0;
             if let Err(e) = sys::esp!(unsafe { sys::esp_partition_mmap(partition, 0, partition_size, sys::esp_partition_mmap_memory_t_ESP_PARTITION_MMAP_DATA, &mut ptr, &mut handle) }) {
                 log::error!("'{PKG_PARTITION_LABEL}' partition mmap failed: {e:?}");
-                return false;
+                return None;
             }
             *mapping = Some(ptr as *const u8);
             ptr as *const u8
@@ -304,5 +322,5 @@ fn load_pkg_partition(g: &mut Global, mapping: &mut Option<*const u8>) -> bool {
     let ret = g.runtime.surface.media.load_pkg(ptr, len, 2);
     let loaded = matches!(ret, Ret::Ok);
     log::info!("pkg load: {}", ret as u8);
-    loaded
+    loaded.then_some(len)
 }

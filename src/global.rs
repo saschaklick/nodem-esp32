@@ -79,7 +79,7 @@ impl std::fmt::Display for WifiStatus {
 /// later websocket reconnect.
 #[derive(Clone)]
 pub enum RegistrationStatus {
-    WaitingForCode,
+    NoCode,
     Registering,
     Registered,
     Failed(String),
@@ -108,7 +108,7 @@ impl CloudStatus {
         Self {
             host: None,
             device_name: None,
-            registration: RegistrationStatus::WaitingForCode,
+            registration: RegistrationStatus::NoCode,
             connection: CloudConnectionStatus::Disconnected,
         }
     }
@@ -117,7 +117,7 @@ impl CloudStatus {
 impl std::fmt::Display for CloudStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.registration {
-            RegistrationStatus::WaitingForCode => write!(f, "Reg: waiting for code"),
+            RegistrationStatus::NoCode => write!(f, "Reg: no code"),
             RegistrationStatus::Registering => write!(f, "Reg: registering..."),
             RegistrationStatus::Failed(e) => write!(f, "Reg: failed ({e})"),
             RegistrationStatus::Registered => {
@@ -284,6 +284,42 @@ pub struct Global {
     // `uart_task`/`websocket_task` right after a "#ping"/"#factory", same
     // pattern as `iled_config`. Read fresh by the ping loop every lap.
     pub ping_interval_secs: u64,
+    // The pkg in the "pkg" partition, as `nodem::load_pkg_partition` last
+    // found it: its size in bytes (0 if none loaded), the partition's size
+    // (the most a future pkg can take - it replaces the current one), and a
+    // counter bumped on every (re)load/unload so `StatSnapshot` notices even
+    // a same-sized replacement. Reported by "#stat"'s "pkg" line.
+    pub pkg_size: usize,
+    pub pkg_partition_size: usize,
+    pub pkg_generation: u32,
+    // How many update-worthy changes (see `StatSnapshot`) happened since the
+    // last "#stat" - sent on every websocket ping, so the server knows when
+    // a fresh "#stat" is worth asking for. Reset to 0 by "#stat" itself.
+    pub stat_events: u32,
+    last_stat_snapshot: Option<StatSnapshot>,
+}
+
+/// The part of the device's state a "#stat" reader would want to know
+/// changed - compared frame by frame by `Global::track_stat_events`. Only
+/// state *transitions* are in here: signal strength, temperature, free heap,
+/// the OLED's error counters and the text of an error message (as long as
+/// the state itself stays the same) deliberately aren't.
+#[derive(Clone, PartialEq)]
+struct StatSnapshot {
+    wifi: core::mem::Discriminant<WifiConnectionStatus>,
+    ssid: Option<String>,
+    ip: Option<Ipv4Addr>,
+    registration: core::mem::Discriminant<RegistrationStatus>,
+    connection: core::mem::Discriminant<CloudConnectionStatus>,
+    host: Option<String>,
+    device_name: Option<String>,
+    oled: core::mem::Discriminant<OledConnectionStatus>,
+    oled_config: Option<OledConfig>,
+    iled_config: Option<IledConfig>,
+    nodem_config: NodemConfig,
+    ping_interval_secs: u64,
+    rollback_pending: bool,
+    pkg_generation: u32,
 }
 
 impl Global {
@@ -314,6 +350,43 @@ impl Global {
             ws_client: None,
             temp_sensor: None,
             ping_interval_secs: crate::websocket::DEFAULT_PING_INTERVAL_SECS,
+            pkg_size: 0,
+            pkg_partition_size: 0,
+            pkg_generation: 0,
+            stat_events: 0,
+            last_stat_snapshot: None,
+        }
+    }
+
+    fn stat_snapshot(&self) -> StatSnapshot {
+        StatSnapshot {
+            wifi: core::mem::discriminant(&self.wifi_status.status),
+            ssid: self.wifi_status.ssid.clone(),
+            ip: self.wifi_status.ip,
+            registration: core::mem::discriminant(&self.cloud_status.registration),
+            connection: core::mem::discriminant(&self.cloud_status.connection),
+            host: self.cloud_status.host.clone(),
+            device_name: self.cloud_status.device_name.clone(),
+            oled: core::mem::discriminant(&self.oled_status.status),
+            oled_config: self.oled_config,
+            iled_config: self.iled_config,
+            nodem_config: self.nodem_config,
+            ping_interval_secs: self.ping_interval_secs,
+            rollback_pending: self.sys_status.rollback_pending,
+            pkg_generation: self.pkg_generation,
+        }
+    }
+
+    /// Counts one `stat_events` whenever the `StatSnapshot` differs from the
+    /// last call's - however many of its fields changed at once. Polled
+    /// (every `nodem_task` frame) rather than bumped at each place that
+    /// changes state, so no such place can forget to - at the cost of a
+    /// change that's undone again within one frame going unseen.
+    pub fn track_stat_events(&mut self) {
+        let snapshot = self.stat_snapshot();
+        if self.last_stat_snapshot.as_ref() != Some(&snapshot) {
+            self.stat_events = self.stat_events.saturating_add(1);
+            self.last_stat_snapshot = Some(snapshot);
         }
     }
 

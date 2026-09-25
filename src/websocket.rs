@@ -68,7 +68,9 @@ pub(crate) const NVS_KEY_CLOUD_HOST: &str = "cloud_host";
 /// attempt is rejected - too short to ever collide with a real code (`uart`'s
 /// "#reg" command only accepts a 6-character code as its first argument).
 /// Marks the code as spent (so it isn't retried forever) while leaving a
-/// visible trace, via "#nvs", that the last attempt failed.
+/// trace that the last attempt failed - `ensure_device_credentials` reports
+/// it as `RegisterError::Rejected`, so the device keeps showing "reg_failed"
+/// (even across reboots) instead of falling back to "no_reg".
 const NVS_VALUE_REGISTRATION_REJECTED: &str = "0";
 
 /// Manages device registration and the websocket client connection.
@@ -124,7 +126,17 @@ pub async fn websocket_task(global: Rc<RefCell<Global>>, nvs: EspDefaultNvsParti
             match ensure_device_credentials(&device_nvs, &global) {
                 Ok(credentials) => break credentials,
                 Err(RegisterError::MissingCode) => {
-                    global.borrow_mut().cloud_status.registration = RegistrationStatus::WaitingForCode;
+                    global.borrow_mut().cloud_status.registration = RegistrationStatus::NoCode;
+                    Timer::after_secs(2).await;
+                }
+                Err(RegisterError::Rejected) => {
+                    // Keeps the actual error from this boot's failed attempt,
+                    // if there was one.
+                    let mut g = global.borrow_mut();
+                    if !matches!(g.cloud_status.registration, RegistrationStatus::Failed(_)) {
+                        g.cloud_status.registration = RegistrationStatus::Failed("rejected".to_string());
+                    }
+                    drop(g);
                     Timer::after_secs(2).await;
                 }
                 Err(RegisterError::Failed(e)) => {
@@ -221,7 +233,8 @@ pub async fn websocket_task(global: Rc<RefCell<Global>>, nvs: EspDefaultNvsParti
             if connected && last_ping.elapsed() >= embassy_time::Duration::from_secs(global.borrow().ping_interval_secs) {
                 last_ping = Instant::now();
 
-                let ping = format!("ping,{}", Instant::now().as_secs());
+                // "ping,<uptime_s>,<stat_events>" - see `Global::stat_events`.
+                let ping = format!("ping,{},{}", Instant::now().as_secs(), global.borrow().stat_events);
                 if let Err(e) = send_text(&global, &ping) {
                     log::error!("Failed to send websocket ping, reconnecting: {e:?}");
                     close_websocket(&global);
@@ -298,6 +311,9 @@ fn handle_incoming_message(
             }
             if command_listener.take_pkg_updated() {
                 g.pkg_reload = true;
+            }
+            if command_listener.take_stat_reported() {
+                g.stat_events = 0;
             }
 
             ret
@@ -431,6 +447,9 @@ enum RegisterError {
     /// No registration code has been provisioned into NVS yet - not a failure,
     /// just something to wait out.
     MissingCode,
+    /// The last registration attempt failed and its code has been spent
+    /// (`NVS_VALUE_REGISTRATION_REJECTED`) - waiting for a fresh "#reg".
+    Rejected,
     Failed(anyhow::Error),
 }
 
@@ -449,9 +468,9 @@ fn ensure_device_credentials(
     global: &Rc<RefCell<Global>>,
 ) -> Result<(String, String), RegisterError> {
     let mut code_buf = [0u8; 64];
-    let registration_code = match nvs.get_str(NVS_KEY_REGISTRATION_CODE, &mut code_buf) {
-        Ok(Some(code)) if code != NVS_VALUE_REGISTRATION_REJECTED => Some(code),
-        Ok(_) => None,
+    let (registration_code, rejected) = match nvs.get_str(NVS_KEY_REGISTRATION_CODE, &mut code_buf) {
+        Ok(Some(code)) if code == NVS_VALUE_REGISTRATION_REJECTED => (None, true),
+        Ok(code) => (code, false),
         Err(e) => return Err(RegisterError::Failed(e.into())),
     };
 
@@ -465,6 +484,7 @@ fn ensure_device_credentials(
             nvs.get_str(NVS_KEY_DEVICE_SECRET, &mut secret_buf),
         ) {
             (Ok(Some(id)), Ok(Some(secret))) => Ok((id.to_string(), secret.to_string())),
+            _ if rejected => Err(RegisterError::Rejected),
             _ => Err(RegisterError::MissingCode),
         };
 
@@ -487,7 +507,7 @@ fn ensure_device_credentials(
     // fix able to clear it. Instead, treat it the same as no code ever
     // having been stored: clear the stray code and report `MissingCode`
     // (not a fabricated placeholder name, still) - the caller already
-    // turns that into `RegistrationStatus::WaitingForCode` and keeps
+    // turns that into `RegistrationStatus::NoCode` and keeps
     // retrying, so a fresh, valid "#reg" recovers the device on its own.
     let mut name_buf = [0u8; 128];
     let device_name = match nvs.get_str(NVS_KEY_DEVICE_NAME, &mut name_buf) {
