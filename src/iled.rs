@@ -736,7 +736,28 @@ const _: () = assert!(DMA_BUFFER_LEN <= I2S_DMA_BUFFER_MAX);
 /// DMA ring size (ESP-IDF's usual default) - it needs room for at least one
 /// whole frame.
 const DMA_BUFFER_COUNT: usize = 6;
-const _: () = assert!(DMA_BUFFERS_PER_FRAME <= DMA_BUFFER_COUNT);
+// +1 for `LEAD_GUARD`, and ESP-IDF's free-buffer queue only holds
+// `DMA_BUFFER_COUNT - 1` of the ring at once.
+const _: () = assert!(DMA_BUFFERS_PER_FRAME + 1 <= DMA_BUFFER_COUNT - 1);
+
+/// One whole DMA buffer of low output, written ahead of every frame (see
+/// `write_frame`). ESP-IDF's `i2s_channel_write` takes its next buffer from
+/// a queue the TX-EOF ISR refills; if that ISR runs late (flash/NVS writes,
+/// WiFi), the queue's oldest entry can be the buffer the DMA has *already
+/// started* shifting out. A frame copied into it would be picked up
+/// mid-buffer - the chain sees its first bits missing, every LED's packet
+/// slips by the same amount, and the whole matrix shows a wrong color.
+/// Sacrificing that possibly-live buffer to zeros (identical to the
+/// auto-cleared idle output it'd have sent anyway) means the real frame
+/// always lands in a buffer the DMA hasn't reached yet.
+static LEAD_GUARD: [u8; DMA_BUFFER_LEN] = [0; DMA_BUFFER_LEN];
+
+/// Sends `LEAD_GUARD` then `frame` - see `LEAD_GUARD`. Both are whole DMA
+/// buffers, so the frame still starts exactly on a buffer boundary.
+async fn write_frame(i2s: &mut I2sDriver<'static, I2sTx>, frame: &[u8; FRAME_LEN]) -> Result<(), esp_idf_svc::sys::EspError> {
+    i2s.write_all_async(&LEAD_GUARD).await?;
+    i2s.write_all_async(frame).await
+}
 
 // pub(crate): what `Framebuffer::render` fills and `iled_task` writes in
 // one go - `MIN_FRAME_LEN` rounded up to whole DMA buffers. Whatever's
@@ -1105,7 +1126,7 @@ pub async fn iled_task(global: Rc<RefCell<Global>>, nvs: EspDefaultNvsPartition)
             if enabled {
                 let fb = Framebuffer::blank(config);
                 fb.render(&mut frame);
-                if let Err(e) = i2s.write_all_async(&frame).await {
+                if let Err(e) = write_frame(&mut i2s, &frame).await {
                     log::error!("iLED I2S write failed while disabling: {e:?}");
                 }
                 enabled = false;
@@ -1143,7 +1164,7 @@ pub async fn iled_task(global: Rc<RefCell<Global>>, nvs: EspDefaultNvsPartition)
         }
 
         fb.render(&mut frame);
-        if let Err(e) = i2s.write_all_async(&frame).await {
+        if let Err(e) = write_frame(&mut i2s, &frame).await {
             log::error!("iLED I2S write failed: {e:?}");
         }
 
