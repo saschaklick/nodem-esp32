@@ -411,10 +411,10 @@ impl IControl for CommandListener {
                     }
                 }
                 // "#oled,<protocol>:<width>:<height>:<x>:<y>[:<rotation>]" -
-                // see `oled::OledConfig`. An empty value ("#oled") or any
-                // protocol other than "ssd1306" is stored as given and
-                // disables the display; a malformed "ssd1306" value is
-                // rejected. Applied right away (`Global::oled_config`).
+                // see `oled::OledConfig`. An empty value ("#oled") or an
+                // unknown protocol (not an `oled::OledChip`) is stored as
+                // given and disables the display; a malformed value for a
+                // known chip is rejected. Applied right away (`Global::oled_config`).
                 "oled" => {
                     let value = args.trim();
                     match OledConfig::parse(value) {

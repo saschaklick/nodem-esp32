@@ -173,8 +173,8 @@ impl std::fmt::Display for SysStatus {
     }
 }
 
-/// Where `oled_task` currently is with the SSD1306 - `Failed` after the
-/// initial `init()` failed lasts until `Global::oled_config` changes,
+/// Where `oled_task` currently is with the panel - `Failed` after the
+/// initial init failed lasts until `Global::oled_config` changes,
 /// whereas after a failed reinitialization the next flush simply tries again.
 /// `Disabled` while `Global::oled_config` is `None`.
 #[derive(Clone)]
