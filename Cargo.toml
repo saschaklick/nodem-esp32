@@ -14,7 +14,10 @@ name = "nodem-esp32"
 harness = false
 
 [features]
+default = ["cloud", "dom", "vm"]
 cloud = []
+dom = ["nodem-rs/dom", "nodem-rs/xml"]
+vm = ["virtmach", "nodem-rs/vm"]
 
 [profile.release]
 strip = true
@@ -39,8 +42,8 @@ embedded-svc = "0.29"
 esp-idf-svc = { version = "0.52.1", features = ["critical-section", "embassy-time-driver", "embassy-sync"] }
 embassy-time = { version = "0.5", features = ["generic-queue-8"] }
 edge-executor = "0.5"
-nodem-rs = { git = "https://github.com/saschaklick/nodem-rs", features = ["std", "base", "alloc", "runtime"] }
-virtmach = { git = "https://github.com/saschaklick/virtmach-rs", features = ["i16", "random"] }
+nodem-rs = { git = "https://github.com/saschaklick/nodem-rs", features = ["ninepatch", "inspect", "alloc", "runtime"] }
+virtmach = { git = "https://github.com/saschaklick/virtmach-rs", features = ["i16", "random"], optional = true }
 
 [build-dependencies]
 embuild = "0.33"

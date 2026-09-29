@@ -294,8 +294,11 @@ fn load_pkg_partition_inner(g: &mut Global, mapping: &mut Option<*const u8>) -> 
         // whatever pkg was loaded, and the DOM built from its page - both
         // point into the flash that no longer holds it.
         log::info!("'{PKG_PARTITION_LABEL}' partition has no pkg, unloading");
-        g.runtime.surface.media.unload_pkg();
-        g.runtime.dom.clear();
+        g.runtime.surface.media.unload_pkg();        
+        #[cfg(feature = "dom")]
+        g.runtime.dom.clear();        
+        #[cfg(feature = "vm")]
+        g.runtime.vm.reset();
         return None;
     }
     let len = u32::from_ne_bytes(header[4..8].try_into().unwrap()) as usize;
