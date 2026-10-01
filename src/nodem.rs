@@ -216,7 +216,28 @@ pub async fn nodem_task(global: Rc<RefCell<Global>>, nvs: EspDefaultNvsPartition
             let message = show_report.then(|| format!("{}{{br}}{}{{br}}{}", g.sys_status, g.wifi_status, g.cloud_status));
             set_status_message(&mut g.runtime, message);
 
+            #[cfg(feature = "vm")]
+            {
+                // a reset or newly loaded program starts counting from now
+                if g.runtime.vm.cycle_cnt == 0 {
+                    g.vm_clock.restart();
+                }
+            }
+            // A program waiting in the time interrupt is paused (`Hlt`), which
+            // `vm.run` resumes at once. So for the length of this frame it's
+            // parked in `Err` instead: `vm.run` doesn't resume that and
+            // `Env::run` doesn't render the DOM for it either - see `int_time`.
+            #[cfg(feature = "vm")]
+            let vm_held = g.runtime.vm.paused() && g.vm_clock.hold();
+            #[cfg(feature = "vm")]
+            if vm_held {
+                g.runtime.vm.state = virtmach::Runtime::Err;
+            }
             g.runtime.run();
+            #[cfg(feature = "vm")]
+            if vm_held {
+                g.runtime.vm.state = virtmach::Runtime::Hlt;
+            }
             // Piggybacks on this always-running 60Hz loop - see
             // `Global::track_stat_events`.
             g.track_stat_events();
@@ -233,7 +254,7 @@ pub async fn nodem_task(global: Rc<RefCell<Global>>, nvs: EspDefaultNvsPartition
 /// Wi-Fi/cloud events, not every frame. `DOM::status_message` borrows a
 /// `&'static str`, so each new message is leaked into one and the previous
 /// one freed here once `runtime` no longer points at it.
-fn set_status_message(runtime: &mut nodem_rs::runtime::DOM<'static>, message: Option<String>) {
+fn set_status_message(runtime: &mut nodem_rs::runtime::Env<'static>, message: Option<String>) {
     if runtime.status_message == message.as_deref() {
         return;
     }

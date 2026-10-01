@@ -2,9 +2,17 @@ use std::net::Ipv4Addr;
 
 use esp_idf_svc::hal::temp_sensor::TempSensorDriver;
 use esp_idf_svc::ws::client::EspWebSocketClient;
-use nodem_rs::runtime::DOM;
+use nodem_rs::runtime::Env;
+#[cfg(feature = "vm")]
+use std::rc::Rc;
+#[cfg(feature = "vm")]
+use virtmach::interrupts::{gpio, time};
 
 use crate::iled::IledConfig;
+#[cfg(feature = "vm")]
+use crate::int_gpio::Gpio;
+#[cfg(feature = "vm")]
+use crate::int_time::{Time, VmClock};
 use crate::nodem::NodemConfig;
 use crate::oled::OledConfig;
 
@@ -245,7 +253,11 @@ pub struct Global {
     // `'static`: `runtime.status_message` borrows a string that `Global`
     // can't own alongside it - `nodem_task` leaks each new status text and
     // frees the previous one itself, see `set_status_message` there.
-    pub runtime: DOM<'static>,
+    pub runtime: Env<'static>,
+    // Shared with the VM's time interrupt (owned by `runtime`): `nodem_task`
+    // holds the VM while a wait's deadline is pending - see `int_time`.
+    #[cfg(feature = "vm")]
+    pub vm_clock: Rc<VmClock>,
     // Incoming-command staging buffer for `uart_task`: bytes read off the UART
     // accumulate here until `runtime.process_command` has consumed a full
     // command; `command_buf_pos` is how much of it is currently filled.
@@ -325,11 +337,19 @@ struct StatSnapshot {
 impl Global {
     pub fn new(nodem_config: NodemConfig) -> Self {
         let mut display_buffer = vec![0u8; nodem_config.buffer_len()].into_boxed_slice();
-        let runtime = DOM::new(
+        #[allow(unused_mut)]
+        let mut runtime = Env::new(
             &mut display_buffer[..],
             nodem_config.width,
             nodem_config.height,
         );
+        #[cfg(feature = "vm")]
+        let vm_clock = Rc::new(VmClock::new());
+        #[cfg(feature = "vm")]
+        {
+            runtime.set_vm_interrupt(time::INDEX as usize, Box::new(Time { clock: vm_clock.clone() }));
+            runtime.set_vm_interrupt(gpio::INDEX as usize, Box::new(Gpio::default()));
+        }
 
         Self {
             sys_status: SysStatus::new(),
@@ -340,6 +360,8 @@ impl Global {
             nodem_config,
             display_buffer_dirty: [false; DISPLAY_BUFFER_CONSUMERS],
             runtime,
+            #[cfg(feature = "vm")]
+            vm_clock,
             command_buf: [0u8; COMMAND_BUF_LEN],
             command_buf_pos: 0,
             wifi_reconnect: false,

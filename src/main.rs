@@ -17,6 +17,10 @@ mod driver;
 mod global;
 mod heartbeat;
 mod iled;
+#[cfg(feature = "vm")]
+mod int_gpio;
+#[cfg(feature = "vm")]
+mod int_time;
 mod nodem;
 mod oled;
 mod uart;
