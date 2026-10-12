@@ -1,5 +1,8 @@
 //! The VM's time interrupt, see `virtmach::interrupts::time` for the functions.
 //!
+//! set_tick keeps the interval the VM is held after a program stopped with
+//! HLT, see `VmClock::start_tick`; it is 0 again for a restarted program.
+//!
 //! Waits don't block inside `call` - that would stall every other task on
 //! the single-threaded executor (wifi, websocket, uart, ...) for the whole
 //! interval. Instead the deadline goes into the shared `VmClock`, the VM is
@@ -30,12 +33,14 @@ pub struct VmClock {
     last: Cell<Instant>,
     /// Set by a wait, the VM is held until then.
     deadline: Cell<Option<Instant>>,
+    /// Set by set_tick: how long the VM is held after the program halted.
+    tick: Cell<Duration>,
 }
 
 impl VmClock {
     pub fn new() -> Self {
         let now = Instant::now();
-        Self { started: Cell::new(now), last: Cell::new(now), deadline: Cell::new(None) }
+        Self { started: Cell::new(now), last: Cell::new(now), deadline: Cell::new(None), tick: Cell::new(Duration::ZERO) }
     }
 
     /// A (re)started program: counts from now and drops a pending wait.
@@ -44,6 +49,16 @@ impl VmClock {
         self.started.set(now);
         self.last.set(now);
         self.deadline.set(None);
+        self.tick.set(Duration::ZERO);
+    }
+
+    /// Called after the VM ran and is paused without a wait pending, i.e. the
+    /// program stopped with HLT: holds it for the tick before it runs again.
+    pub fn start_tick(&self) {
+        let tick = self.tick.get();
+        if self.deadline.get().is_none() && !tick.is_zero() {
+            self.deadline.set(Some(Instant::now() + tick));
+        }
     }
 
     /// Whether the VM has to wait this frame, clears the deadline once it passed.
@@ -113,8 +128,15 @@ impl<S: Storage> SoftInterrupt<S> for Time {
                 self.clock.deadline.set(Some(deadline));
                 vm.pause();
             }
+            3 => {
+                let (seconds, milliseconds) = (vm.stack_pop(), vm.stack_pop());
+                match interval(seconds, milliseconds) {
+                    Some(tick) => self.clock.tick.set(tick),
+                    None => vm.error = RuntimeError::InterruptError,
+                }
+            }
             // pushed as hours, minutes, seconds, ms
-            2 => {
+            10 => {
                 let (hours, minutes, seconds, ms) = match local_time() {
                     Some((local, ms)) => (local.tm_hour as u64, local.tm_min as u64, local.tm_sec as u64, ms as u64),
                     None => {
@@ -126,7 +148,7 @@ impl<S: Storage> SoftInterrupt<S> for Time {
                 for value in [hours, minutes, seconds, ms] { vm.stack_push(value as VMAtom); }
             }
             // pushed as year, month, day
-            3 => {
+            11 => {
                 let (year, month, day) = match local_time() {
                     Some((local, _)) => (local.tm_year + 1900, local.tm_mon + 1, local.tm_mday),
                     None => (0, 0, 0),

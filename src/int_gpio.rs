@@ -1,5 +1,6 @@
-//! The VM's gpio interrupt on the ESP32-C3, see `virtmach::interrupts::gpio`
-//! for the functions. Pins are the chip's GPIO numbers, port p holds the pins
+//! The gpio part of the VM's periph interrupt on the ESP32-C3, see
+//! `virtmach::interrupts::periph` (gpio_*) for the functions; `call` gets the
+//! function number counted from `periph::GPIO`. Pins are the chip's GPIO numbers, port p holds the pins
 //! p * VMAtom::BITS up to p * VMAtom::BITS + VMAtom::BITS - 1.
 //!
 //! Only the pins the firmware doesn't use itself are open to programs, see
@@ -13,7 +14,7 @@ use esp_idf_svc::sys::{
     gpio_mode_t_GPIO_MODE_INPUT_OUTPUT_OD, gpio_pull_mode_t_GPIO_FLOATING, gpio_pull_mode_t_GPIO_PULLDOWN_ONLY,
     gpio_pull_mode_t_GPIO_PULLUP_ONLY, gpio_reset_pin, gpio_set_direction, gpio_set_level, gpio_set_pull_mode,
 };
-use virtmach::{interrupts::{gpio, SoftInterrupt}, RuntimeError, Storage, VMAtom, VirtMach};
+use virtmach::{RuntimeError, Storage, VMAtom, VirtMach};
 
 /// GPIO0, 4-7 and 10. Taken: 1-3 by the I2S LED chain (`iled`), 8/9 by the
 /// OLED's I2C, 11-17 by the SPI flash, 18/19 by USB and 20/21 by UART0.
@@ -28,7 +29,7 @@ pub struct Gpio {
 }
 
 impl Gpio {
-    fn allowed(pin: VMAtom) -> bool {
+    pub fn allowed(pin: VMAtom) -> bool {
         (0..32).contains(&pin) && ALLOWED & (1 << pin) != 0
     }
 
@@ -64,13 +65,8 @@ impl Gpio {
     }
 }
 
-impl<S: Storage> SoftInterrupt<S> for Gpio {
-    fn name(&self) -> &str {
-        return gpio::NAME;
-    }
-
-    fn call(&mut self, vm: &mut VirtMach<S>) {
-        let op = vm.stack_pop();
+impl Gpio {
+    pub fn call<S: Storage>(&mut self, vm: &mut VirtMach<S>, op: VMAtom) {
         match op {
             0..=6 => {
                 let pin = vm.stack_pop();

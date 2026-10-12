@@ -237,6 +237,10 @@ pub async fn nodem_task(global: Rc<RefCell<Global>>, nvs: EspDefaultNvsPartition
             #[cfg(feature = "vm")]
             if vm_held {
                 g.runtime.vm.state = virtmach::Runtime::Hlt;
+            } else if g.runtime.vm.paused() {
+                // halted by the program itself (a wait has its deadline set
+                // already): hold it for the tick set with set_tick
+                g.vm_clock.start_tick();
             }
             // Piggybacks on this always-running 60Hz loop - see
             // `Global::track_stat_events`.

@@ -6,11 +6,11 @@ use nodem_rs::runtime::Env;
 #[cfg(feature = "vm")]
 use std::rc::Rc;
 #[cfg(feature = "vm")]
-use virtmach::interrupts::{gpio, time};
+use virtmach::interrupts::{periph, time};
 
 use crate::iled::IledConfig;
 #[cfg(feature = "vm")]
-use crate::int_gpio::Gpio;
+use crate::int_periph::Periph;
 #[cfg(feature = "vm")]
 use crate::int_time::{Time, VmClock};
 use crate::nodem::NodemConfig;
@@ -348,7 +348,7 @@ impl Global {
         #[cfg(feature = "vm")]
         {
             runtime.set_vm_interrupt(time::INDEX as usize, Box::new(Time { clock: vm_clock.clone() }));
-            runtime.set_vm_interrupt(gpio::INDEX as usize, Box::new(Gpio::default()));
+            runtime.set_vm_interrupt(periph::INDEX as usize, Box::new(Periph::default()));
         }
 
         Self {

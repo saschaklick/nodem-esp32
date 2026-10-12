@@ -20,7 +20,15 @@ mod iled;
 #[cfg(feature = "vm")]
 mod int_gpio;
 #[cfg(feature = "vm")]
+mod int_i2c;
+#[cfg(feature = "vm")]
+mod int_periph;
+#[cfg(feature = "vm")]
+mod int_pwm;
+#[cfg(feature = "vm")]
 mod int_time;
+#[cfg(feature = "vm")]
+mod int_uart;
 mod nodem;
 mod oled;
 mod uart;
